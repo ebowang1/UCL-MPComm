@@ -81,6 +81,10 @@ static constexpr size_t MPCOMM_DEFAULT_QPS_PER_CONNECTION = 1;
 // Setting MPCOMM_GID_INDEX=-1 enables auto-selection of the first non-zero GID.
 static constexpr int MPCOMM_DEFAULT_GID_INDEX = 3;
 
+// Optional RoCE DSCP marking: set MPCOMM_ROCE_DSCP to a value in [0, 63].
+// MPComm writes DSCP << 2 into each local QP's GRH Traffic Class; the default
+// is DSCP 0, preserving the historical behavior.
+
 // NUMA topology information for a single NUMA node
 struct NumaTopology {
     int numa_node;
@@ -99,14 +103,21 @@ struct RemoteBufferEntry {
     uint64_t addr;
     uint64_t length;
     int numa_node;
+    // CUDA device ordinal for a published GPU buffer; -1 for CPU memory.
+    int gpu_device_id = -1;
+    // Remote NIC indices that share PCIe affinity with gpu_device_id.
+    std::vector<size_t> pcie_affine_nic_indices;
     std::vector<uint32_t> rkeys;
 };
 
-// Single published buffer entry with NUMA info
+// Single published buffer entry with NUMA and GPU-affinity information.
 struct PublishedBufferEntry {
     uint64_t addr;
     uint64_t length;
     int numa_node;
+    // CUDA device ordinal for this buffer; -1 for CPU memory.
+    int gpu_device_id = -1;
+    std::vector<size_t> pcie_affine_nic_indices;
     std::vector<uint32_t> rkeys;
 };
 
@@ -393,6 +404,62 @@ class MPComm {
 
     /** Get the current max RDMA transfer size */
     size_t getMaxRdmaTransferSize() const;
+
+    /**
+     * Legacy runtime flow-control override.
+     *
+     * This API remains for compatibility and diagnostics. H2D QoS does not
+     * call it: H2D priority is implemented exclusively through post-rate
+     * pacing, while outstanding remains a static QP safety guard.
+     */
+    void setNicThrottle(size_t max_outstanding_per_qp, size_t chunk_size);
+
+    /** Remove the runtime throttle and restore baseline limits */
+    void clearNicThrottle();
+
+    /**
+     * Enable H2D-triggered RDMA post pacing.
+     *
+     * Every tmaGather identifies its destination GPU, then asynchronously
+     * pauses or rate-limits only RDMA flows that contend for that GPU's
+     * PCIe-affine NICs. rate_bytes_per_sec=0 pauses new matching posts; a
+     * non-zero rate is enforced by a shared byte token bucket.
+     */
+    void enableH2DQoS(uint64_t rate_bytes_per_sec = 0,
+                      uint64_t burst_bytes = 0);
+
+    /** Update the default pace applied by subsequently active H2D windows. */
+    void setH2DQoSPolicy(uint64_t rate_bytes_per_sec,
+                         uint64_t burst_bytes = 0);
+
+    /** Return whether H2D-triggered post pacing is enabled. */
+    bool isH2DQoSEnabled() const;
+
+    /** Disable H2D-triggered post pacing and restore all paused flows. */
+    void disableH2DQoS();
+
+    /**
+     * Cumulative NIC->GPU bytes whose RDMA CQE has completed since init.
+     *
+     * Intended for benchmarks that need the background NIC bandwidth inside an
+     * exact wall-clock window (e.g. the lifetime of a single H2D kernel):
+     * sample this before and after the window and divide the delta by the
+     * elapsed time. Counts per successful CQE at chunk granularity, so it
+     * reflects bytes actually delivered to GPU HBM rather than whole transfers.
+     */
+    uint64_t getNicCompletedBytes() const;
+
+    /**
+     * Read throttle latency instrumentation (CLOCK_MONOTONIC_RAW, ns).
+     *   set_ns         - when the throttle policy was published
+     *   worker_seen_ns - when a worker first observed the new policy
+     *   drained_ns     - when all WQEs posted before the throttle completed
+     *   snapshot_outstanding_wqes - sum(posted-completed) at worker observation
+     * Returns true once drained_ns is available.
+     */
+    bool getThrottleLatency(uint64_t* set_ns, uint64_t* worker_seen_ns,
+                            uint64_t* drained_ns,
+                            size_t* snapshot_outstanding_wqes) const;
 
     /** Get the number of QPs per connection */
     size_t getQpsPerConnection() const;

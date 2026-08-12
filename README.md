@@ -31,6 +31,7 @@ performance levels that approach the physical limits of the hardware.
 <p align="center">
   <a href="#key-features">Key Features</a> |
   <a href="#getting-started">Getting Started</a> |
+  <a href="#h2d--nic-to-gpu-qos-benchmarks">QoS Benchmarks</a> |
   <a href="#performance">Performance</a> |
   <a href="#open-source-plan">Open Source Plan</a>
 </p>
@@ -45,6 +46,7 @@ performance levels that approach the physical limits of the hardware.
 - **NUMA affinity** — auto-detects NIC ↔ NUMA topology; allocates / publishes / matches buffers per NUMA node.
 - **Two data paths** — **zero-copy** (pre-registered user buffer, direct one-sided access) and **non-zero-copy** (unregistered buffer routed through a multi-threaded staging pool).
 - **HBM ↔ DRAM movement** — Hopper **TMA** (`cp.async.bulk`) and **SM int4-vectorized** H2D kernels (`tmaGather` / `tmaScatter`).
+- **H2D-aware RDMA QoS** — optionally pauses or rate-limits matching RDMA posts while an H2D kernel is active, then automatically restores them; supports RoCE DSCP through `MPCOMM_ROCE_DSCP`.
 
 ---
 
@@ -81,6 +83,10 @@ export PYTHONPATH=/path/to/ucl-mpcomm/mpcomm-install/lib/python:$PYTHONPATH
 pip install .          # or: sh build_wheel.sh
 python -c "import mpcomm; print(mpcomm.__file__)"
 ```
+
+### H2D / NIC-to-GPU QoS Benchmarks
+
+The migrated `user_examples/qos_bench/` suite measures local H2D transfers, GPUDirect RDMA NIC-to-GPU transfers, and H2D-triggered RDMA QoS. Build with CUDA enabled, then follow [`user_examples/qos_bench/README-bench.md`](user_examples/qos_bench/README-bench.md).
 
 ---
 

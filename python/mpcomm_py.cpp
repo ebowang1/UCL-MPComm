@@ -258,6 +258,10 @@ class MPCommPy {
      * @return 0 on success, MPCOMM_ERR_TIMEOUT on timeout, or other error code
      */
     int waitTransfer(uint64_t handle, int timeout_ms = -1) {
+        // A blocking wait must not keep the CPython GIL. Otherwise a benchmark
+        // control thread cannot issue set_nic_throttle() until the current
+        // transfer ends, biasing every timing sample to a transfer boundary.
+        py::gil_scoped_release release;
         return comm_.waitTransfer(handle, timeout_ms);
     }
 
@@ -329,6 +333,66 @@ class MPCommPy {
      * Get the number of QPs per connection
      */
     size_t getQpsPerConnection() const { return comm_.getQpsPerConnection(); }
+
+    /**
+     * Apply a runtime NIC throttle. 0 keeps the corresponding baseline value.
+     */
+    void setNicThrottle(size_t max_outstanding_per_qp, size_t chunk_size) {
+        comm_.setNicThrottle(max_outstanding_per_qp, chunk_size);
+    }
+
+    /**
+     * Remove the runtime NIC throttle.
+     */
+    void clearNicThrottle() { comm_.clearNicThrottle(); }
+
+    /** Enable H2D-triggered GPU-specific RDMA post pacing. */
+    void enableH2DQoS(uint64_t rate_bytes_per_sec, uint64_t burst_bytes) {
+        comm_.enableH2DQoS(rate_bytes_per_sec, burst_bytes);
+    }
+
+    /** Update the rate/burst used by subsequently active H2D windows. */
+    void setH2DQoSPolicy(uint64_t rate_bytes_per_sec, uint64_t burst_bytes) {
+        comm_.setH2DQoSPolicy(rate_bytes_per_sec, burst_bytes);
+    }
+
+    bool isH2DQoSEnabled() const { return comm_.isH2DQoSEnabled(); }
+
+    /** Disable H2D-triggered post pacing and restore affected RDMA flows. */
+    void disableH2DQoS() { comm_.disableH2DQoS(); }
+
+    /**
+     * Cumulative NIC->GPU bytes whose RDMA CQE has completed since init.
+     * Used for windowed background-NIC bandwidth measurement.
+     */
+    uint64_t getNicCompletedBytes() const {
+        return comm_.getNicCompletedBytes();
+    }
+
+    /**
+     * Read throttle latency instrumentation.
+     * @return dict with timestamps, the t3 outstanding-WQE snapshot, and
+     *         derived worker/drain/effective durations in microseconds.
+     */
+    py::dict getThrottleLatency() const {
+        uint64_t set_ns = 0, worker_ns = 0, drained_ns = 0;
+        size_t snapshot_outstanding_wqes = 0;
+        bool drained = comm_.getThrottleLatency(&set_ns, &worker_ns, &drained_ns,
+                                                &snapshot_outstanding_wqes);
+        py::dict result;
+        result["set_ns"] = set_ns;
+        result["worker_seen_ns"] = worker_ns;
+        result["drained_ns"] = drained_ns;
+        result["snapshot_outstanding_wqes"] = snapshot_outstanding_wqes;
+        result["drained"] = drained;
+        result["worker_us"] = (worker_ns > set_ns)
+                                  ? (worker_ns - set_ns) / 1000.0 : 0.0;
+        result["drain_us"] = (drained && drained_ns > worker_ns && worker_ns > 0)
+                                  ? (drained_ns - worker_ns) / 1000.0 : 0.0;
+        result["effective_us"] = (drained && drained_ns > set_ns)
+                                  ? (drained_ns - set_ns) / 1000.0 : 0.0;
+        return result;
+    }
 
     /**
      * Write bytes to a registered buffer (for testing)
@@ -417,6 +481,8 @@ class MPCommPy {
                 buf_dict["addr"] = buf.addr;
                 buf_dict["length"] = buf.length;
                 buf_dict["numa_node"] = buf.numa_node;
+                buf_dict["gpu_device_id"] = buf.gpu_device_id;
+                buf_dict["pcie_affine_nic_indices"] = buf.pcie_affine_nic_indices;
                 buf_dict["rkeys"] = buf.rkeys;
                 buffers_list.append(buf_dict);
             }
@@ -446,6 +512,8 @@ class MPCommPy {
             result["addr"] = entry.addr;
             result["length"] = entry.length;
             result["numa_node"] = entry.numa_node;
+            result["gpu_device_id"] = entry.gpu_device_id;
+            result["pcie_affine_nic_indices"] = entry.pcie_affine_nic_indices;
             result["rkeys"] = entry.rkeys;
         }
         return result;
@@ -482,6 +550,8 @@ class MPCommPy {
                 buf_dict["addr"] = buf.addr;
                 buf_dict["length"] = buf.length;
                 buf_dict["numa_node"] = buf.numa_node;
+                buf_dict["gpu_device_id"] = buf.gpu_device_id;
+                buf_dict["pcie_affine_nic_indices"] = buf.pcie_affine_nic_indices;
                 buf_dict["rkeys"] = buf.rkeys;
                 buffers_list.append(buf_dict);
             }
@@ -687,6 +757,29 @@ m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
              "Get the QPs per connection environment variable name (MPCOMM_QPS_PER_CONNECTION)")
         .def("get_qps_per_connection", &MPCommPy::getQpsPerConnection,
              "Get the number of QPs per NIC connection")
+        .def("set_nic_throttle", &MPCommPy::setNicThrottle,
+             py::arg("max_outstanding_per_qp"),
+             py::arg("chunk_size") = 0,
+             "Apply a runtime NIC throttle (0 keeps the baseline value)")
+        .def("clear_nic_throttle", &MPCommPy::clearNicThrottle,
+             "Remove the runtime NIC throttle")
+        .def("enable_h2d_qos", &MPCommPy::enableH2DQoS,
+             py::arg("rate_bytes_per_sec") = 0,
+             py::arg("burst_bytes") = 0,
+             "Enable H2D-triggered GPU-specific RDMA post pacing; rate 0 pauses matching posts")
+        .def("set_h2d_qos_policy", &MPCommPy::setH2DQoSPolicy,
+             py::arg("rate_bytes_per_sec"),
+             py::arg("burst_bytes") = 0,
+             "Update H2D QoS token-bucket rate and burst")
+        .def("is_h2d_qos_enabled", &MPCommPy::isH2DQoSEnabled,
+             "Return whether H2D post-rate QoS is enabled")
+        .def("disable_h2d_qos", &MPCommPy::disableH2DQoS,
+             "Disable H2D-triggered NIC QoS and restore baseline limits")
+        .def("get_nic_completed_bytes", &MPCommPy::getNicCompletedBytes,
+             "Cumulative NIC->GPU bytes whose RDMA CQE has completed since "
+             "init (for windowed background-NIC bandwidth measurement)")
+        .def("get_throttle_latency", &MPCommPy::getThrottleLatency,
+             "Read throttle latency instrumentation (ns timestamps + derived us)")
         .def("write_bytes_to_buffer", &MPCommPy::writeBytesToBuffer,
              py::arg("addr"),
              py::arg("data"),

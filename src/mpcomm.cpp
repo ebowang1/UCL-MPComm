@@ -49,14 +49,17 @@
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <set>
@@ -204,6 +207,63 @@ struct NicContext {
     std::mutex qp_mutex;
 };
 
+// Persistent QoS control frames use the same host-endian ABI as the existing
+// MPComm TCP handshake. Both peers are required to run the same MPComm build.
+static constexpr uint32_t kMsgTypeQosControlOpen = 0x4D505143;  // "MPQC"
+static constexpr uint32_t kQosControlFrameMagic = 0x4D505146;  // "MPQF"
+static constexpr uint32_t kQosControlVersion = 1;
+
+enum class QosControlFrameType : uint32_t {
+    kUpdate = 1,
+    kClear = 2,
+};
+
+struct QosControlHello {
+    uint32_t version;
+    char host_id[128];
+};
+
+struct QosControlFrame {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t type;
+    int32_t target_gpu_device;
+    uint32_t affinity_nic_count;
+    uint32_t affinity_nic_indices[kMaxNics];
+    uint64_t rate_bytes_per_sec;
+    uint64_t burst_bytes;
+    uint64_t generation;
+};
+
+struct QosControlChannel {
+    std::atomic<int> fd{-1};
+    std::string peer_host_id;
+    std::atomic<bool> running{true};
+    std::mutex send_mutex;
+};
+
+// Shared byte-token bucket for one {peer, target GPU} flow group.  It is
+// intentionally shared by all workers/NICs so rate_bytes_per_sec is a total
+// budget rather than a per-NIC multiplier.
+struct QosPacingPolicy {
+    uint64_t rate_bytes_per_sec = 0;
+    uint64_t burst_bytes = 0;
+    uint64_t generation = 0;
+    std::vector<size_t> affinity_nics;
+    double tokens = 0.0;
+    std::chrono::steady_clock::time_point last_refill;
+    std::mutex mutex;
+};
+
+struct H2DActivePolicy {
+    size_t refcount = 0;
+    uint64_t rate_bytes_per_sec = 0;
+    uint64_t burst_bytes = 0;
+    uint64_t generation = 0;
+    std::vector<size_t> affinity_nics;
+    std::shared_ptr<QosPacingPolicy> pacing;
+};
+
 // Connection info for a remote host
 struct ConnectionInfo {
     std::string host_id;
@@ -260,6 +320,9 @@ struct TransferContext {
     std::atomic<bool> submitted;
 
     uintptr_t local_addr;
+    // For GATHER/RDMA READ this identifies whether the local destination is
+    // the GPU protected by an active H2D window.
+    int local_gpu_device_id;
     std::vector<std::string> host_list;
     std::vector<uintptr_t> remote_addrs;
     std::vector<size_t> lengths;
@@ -294,6 +357,9 @@ struct TransferContext {
     }
 
     std::atomic<size_t> next_chunk_idx;
+    // Owned by one selected worker. Chunks denied by a pacing policy are kept
+    // here so the worker can continue posting independent flows.
+    std::deque<size_t> deferred_chunk_indices;
 
     // Fixed-size per-NIC flow control arrays (no heap allocation).
     // Indexed by NIC index; only [0..num_nics_used) are valid.
@@ -427,6 +493,7 @@ struct TransferContext {
         , finished(false)
         , submitted(false)
         , local_addr(0)
+        , local_gpu_device_id(-1)
         , direction(TransferDirection::SCATTER)
         , max_chunk_size(0)
         , next_chunk_idx(0)
@@ -597,6 +664,53 @@ class MPComm::Impl {
     std::string getDeviceName(size_t nic_index) const;
     std::vector<std::string> getActiveDevices() const;
     size_t getMaxRdmaTransferSize() const;
+
+    // Runtime NIC throttle (QoS demo)
+    void setNicThrottle(size_t max_outstanding_per_qp, size_t chunk_size);
+    void clearNicThrottle();
+    bool getThrottleLatency(uint64_t* set_ns, uint64_t* worker_seen_ns,
+                            uint64_t* drained_ns,
+                            size_t* snapshot_outstanding_wqes) const;
+
+    // H2D-triggered QoS. Dynamic control is post-rate pacing only; static
+    // outstanding limits remain a QP-safety guard and are never modified here.
+    void enableH2DQoS(uint64_t rate_bytes_per_sec, uint64_t burst_bytes);
+    void setH2DQoSPolicy(uint64_t rate_bytes_per_sec, uint64_t burst_bytes);
+    bool isH2DQoSEnabled() const;
+    void disableH2DQoS();
+    void beginH2DQoS(int gpu_device_id);
+    void endH2DQoS(int gpu_device_id);
+
+    // Persistent QoS control channel and rate-policy helpers.
+    bool openQosControlChannel(const std::string& remote_host_id,
+                               const std::string& remote_tcp_addr,
+                               int remote_tcp_port);
+    void startQosControlChannel(int fd, const std::string& peer_host_id);
+    void qosControlReceiveLoop(std::shared_ptr<QosControlChannel> channel);
+    void shutdownQosControlChannels();
+    bool sendQosControlFrame(const std::string& peer_host_id,
+                             const QosControlFrame& frame);
+    void broadcastQosControlFrame(const QosControlFrame& frame);
+    void applyRemoteQosPolicy(const std::string& peer_host_id,
+                              const QosControlFrame& frame);
+    void clearRemoteQosPolicies(const std::string& peer_host_id);
+    bool tryConsumeRemoteQosToken(const std::string& peer_host_id,
+                                  int remote_gpu_device_id,
+                                  size_t remote_nic_index,
+                                  size_t bytes);
+    bool tryConsumeLocalReadQosToken(int local_gpu_device_id,
+                                     size_t local_nic_index,
+                                     size_t bytes);
+    QosControlFrame makeQosControlFrame(QosControlFrameType type,
+                                        int gpu_device_id,
+                                        const std::vector<size_t>& affinity_nics,
+                                        uint64_t rate_bytes_per_sec,
+                                        uint64_t burst_bytes,
+                                        uint64_t generation) const;
+    // Cumulative NIC->GPU bytes whose CQE has completed (windowed BW helper).
+    uint64_t getNicCompletedBytes() const {
+        return nic_completed_bytes_.load(std::memory_order_relaxed);
+    }
     size_t getQpsPerConnection() const;
     const std::vector<NumaTopology>& getNumaTopology() const;
     const std::vector<NicTopologyInfo>& getNicTopology() const;
@@ -639,6 +753,8 @@ class MPComm::Impl {
     int modifyQPToRTS(struct ibv_qp *qp);
     void destroyQP(struct ibv_qp *qp);
     uint32_t getLkey(size_t nic_index, void *addr) const;
+    int getRemoteGpuDeviceForAddress(const std::string& remote_host_id,
+                                     uintptr_t remote_addr) const;
     struct ibv_qp *getOrCreateQP(size_t local_nic_index,
                                  const std::string &remote_host_id,
                                  size_t remote_nic_index,
@@ -733,6 +849,7 @@ class MPComm::Impl {
     size_t max_rdma_transfer_size_;
     size_t qps_per_connection_;
     int gid_index_;
+    uint8_t roce_traffic_class_;
 
     std::vector<NumaUniquePtr<NicContext>> nic_contexts_;
 
@@ -803,6 +920,136 @@ class MPComm::Impl {
     int max_send_wr_;
     size_t max_outstanding_per_qp_;
 
+    // ==================== Runtime NIC throttle (QoS demo) ====================
+    // Baseline values captured from env/defaults; throttle overrides are applied
+    // on top of them and can be changed while transfers are in flight.
+    std::atomic<bool> throttle_enabled_{false};
+    std::atomic<size_t> throttle_outstanding_per_qp_{0};   // 0 = keep baseline
+    std::atomic<size_t> throttle_chunk_size_{0};           // 0 = keep baseline
+    // Incremented on every throttle change so workers can detect a new policy.
+    std::atomic<uint64_t> throttle_epoch_{0};
+    // Timestamps (CLOCK_MONOTONIC_RAWns) for latency accounting.
+    std::atomic<uint64_t> throttle_set_ns_{0};        // t2: policy written
+    std::atomic<uint64_t> throttle_worker_seen_ns_{0};// t3: worker observed epoch
+    std::atomic<uint64_t> throttle_drained_ns_{0};    // t4: pre-throttle WQEs done
+    // Sum(posted-completed) captured at t3; validates that a latency sample
+    // was taken while WQEs were genuinely in flight.
+    std::atomic<size_t> throttle_snapshot_outstanding_wqes_{0};
+    std::atomic<bool> throttle_drain_pending_{false};
+
+    // ==================== H2D-triggered post-rate QoS ====================
+    // Master switch. Disabled means tmaGather never alters RDMA post pacing.
+    std::atomic<bool> h2d_qos_enabled_{false};
+    std::atomic<uint64_t> h2d_qos_rate_bytes_per_sec_{0};
+    std::atomic<uint64_t> h2d_qos_burst_bytes_{0};
+    std::atomic<uint64_t> h2d_qos_generation_{0};
+    mutable std::mutex h2d_qos_mutex_;
+    std::unordered_map<int, H2DActivePolicy> active_h2d_policies_;
+
+    // Simplified H2D QoS: a SINGLE shared token bucket. While H2D QoS is
+    // enabled, every local GATHER/READ post consumes from this one bucket so
+    // rate_bytes_per_sec is a total budget across all workers/NICs/QPs. This
+    // deliberately avoids per-GPU policies, affinity matching, CUDA callbacks
+    // and restore threads, so the hot path is just an atomic check + a mutex
+    // token deduction (no null deref, no cross-thread CUDA).
+    std::shared_ptr<QosPacingPolicy> shared_qos_bucket_;
+
+    // Cache of GPU -> PCIe-affine NIC indices. Computing this walks the CUDA
+    // driver + sysfs, which must NOT run while holding h2d_qos_mutex_ or from a
+    // CUDA host callback. It is populated lazily under its own lock outside any
+    // hot path and never invokes CUDA while another QoS lock is held.
+    mutable std::mutex gpu_affinity_cache_mutex_;
+    mutable std::unordered_map<int, std::vector<size_t>> gpu_affinity_cache_;
+
+    // Return cached PCIe-affine NICs for a GPU, computing once if needed. Safe
+    // to call from worker/QoS paths because it never holds h2d_qos_mutex_ while
+    // touching the CUDA driver.
+    std::vector<size_t> getGpuPcieAffinityNicsCached(int gpu_device_id) const {
+        if (gpu_device_id < 0) return {};
+        {
+            std::lock_guard<std::mutex> lock(gpu_affinity_cache_mutex_);
+            auto it = gpu_affinity_cache_.find(gpu_device_id);
+            if (it != gpu_affinity_cache_.end()) return it->second;
+        }
+        std::vector<size_t> nics = getGpuPcieAffinityNics(gpu_device_id);
+        std::lock_guard<std::mutex> lock(gpu_affinity_cache_mutex_);
+        auto& slot = gpu_affinity_cache_[gpu_device_id];
+        if (slot.empty()) slot = std::move(nics);
+        return slot;
+    }
+
+#ifdef USE_CUDA
+    // Deferred H2D-QoS restore. This path must be COMPLETELY free of CUDA API
+    // calls. Two earlier CUDA-based designs both crashed a PyTorch process:
+    //   1) cudaLaunchHostFunc -> its CUDA-managed callback thread races the
+    //      framework's lazy CUDA stream init and corrupts the driver;
+    //   2) recording a CUDA event and waiting on it from a bare worker thread
+    //      that has no bound CUDA context is undefined and corrupts the runtime.
+    // tmaGather launches the H2D kernel and immediately enqueues a host-only
+    // {deadline, gpu} item; a dedicated ORDINARY std::thread sleeps until the
+    // conservative deadline and then runs endH2DQoS (host-side map + a TCP
+    // broadcast, no CUDA). Pacing is lifted slightly after the kernel window
+    // instead of exactly at completion, which is acceptable for a rate limiter.
+    struct H2DQosRestoreItem {
+        std::chrono::steady_clock::time_point deadline;
+        int gpu_device_id;
+    };
+    std::mutex h2d_qos_restore_mutex_;
+    std::condition_variable h2d_qos_restore_cv_;
+    std::deque<H2DQosRestoreItem> h2d_qos_restore_queue_;
+    std::thread h2d_qos_restore_thread_;
+    std::atomic<bool> h2d_qos_restore_running_{false};
+
+    void startH2DQosRestoreThread();
+    void stopH2DQosRestoreThread();
+    void h2dQosRestoreLoop();
+    void enqueueH2DQosRestore(int gpu_device_id);
+#endif
+
+    // Policies received from a remote H2D node. The outer key is the remote
+    // peer host id and the inner key is that peer's protected GPU ordinal.
+    mutable std::mutex remote_qos_policies_mutex_;
+    std::unordered_map<std::string,
+        std::unordered_map<int, std::shared_ptr<QosPacingPolicy>>>
+        remote_qos_policies_;
+    std::atomic<bool> remote_qos_policy_active_{false};
+
+    // A separate full-duplex TCP control connection is retained per peer. It
+    // is intentionally separate from the legacy QP handshake stream so short
+    // buffer queries remain backward compatible.
+    mutable std::mutex qos_channels_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<QosControlChannel>>
+        qos_channels_;
+    std::vector<std::thread> qos_receiver_threads_;
+
+    // Cumulative NIC->GPU bytes whose RDMA READ/WRITE CQE has completed. Used
+    // by benchmarks to measure the background NIC bandwidth inside an exact
+    // wall-clock window (e.g. the lifetime of a single H2D kernel), instead of
+    // only counting whole 1GiB transfers. Incremented per successful CQE.
+    std::atomic<uint64_t> nic_completed_bytes_{0};
+
+    // Effective values honoring the current throttle policy.
+    size_t effectiveOutstandingPerQp() const {
+        if (throttle_enabled_.load(std::memory_order_relaxed)) {
+            size_t value = throttle_outstanding_per_qp_.load(std::memory_order_relaxed);
+            if (value > 0) return std::min(max_outstanding_per_qp_, value);
+        }
+        return max_outstanding_per_qp_;
+    }
+    size_t effectiveChunkSize() const {
+        if (throttle_enabled_.load(std::memory_order_relaxed)) {
+            size_t value = throttle_chunk_size_.load(std::memory_order_relaxed);
+            if (value > 0) return std::min(max_rdma_transfer_size_, value);
+        }
+        return max_rdma_transfer_size_;
+    }
+    static uint64_t monotonicNowNs() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+               static_cast<uint64_t>(ts.tv_nsec);
+    }
+
     bool initialized_;
     size_t transfer_stats_interval_;              // Print stats every N transfers (0 = every transfer)
     std::atomic<size_t> transfer_stats_counter_;  // Global transfer completion counter
@@ -860,6 +1107,13 @@ static const char* kMaxSendWREnvVar = "MPCOMM_MAX_SEND_WR";
 static const char* kMaxOutstandingPerQPEnvVar = "MPCOMM_MAX_OUTSTANDING_PER_QP";
 static const char* kTransferStatsIntervalEnvVar = "MPCOMM_TRANSFER_STATS_INTERVAL";
 static const char* kGidIndexEnvVar = "MPCOMM_GID_INDEX";
+// RoCE DSCP (0-63) applied to the GRH Traffic Class of every local QP.
+// The low two ECN bits remain zero, so traffic_class = DSCP << 2.
+static const char* kRoceDscpEnvVar = "MPCOMM_ROCE_DSCP";
+// H2D post-pacing QoS defaults. rate=0 means pause matching posts.
+static const char* kH2DQosEnableEnvVar = "MPCOMM_H2D_QOS_ENABLE";
+static const char* kH2DQosRateEnvVar = "MPCOMM_H2D_QOS_RATE_BPS";
+static const char* kH2DQosBurstEnvVar = "MPCOMM_H2D_QOS_BURST_BYTES";
 
 // Constants for QP setup
 static const uint8_t kMaxHopLimit = 16;
@@ -933,6 +1187,7 @@ MPComm::Impl::Impl()
       max_rdma_transfer_size_(MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE),
       qps_per_connection_(MPCOMM_DEFAULT_QPS_PER_CONNECTION),
       gid_index_(MPCOMM_DEFAULT_GID_INDEX),
+      roce_traffic_class_(0),
       accept_running_(false),
       num_numa_nodes_(0),
       total_workers_(0),
@@ -988,6 +1243,23 @@ MPComm::Impl::Impl()
         } else {
             MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be -1 or 0-255), using default %d\n",
                     kGidIndexEnvVar, env_val, gid_index_);
+        }
+    }
+
+    // Read RoCE DSCP from environment variable. It occupies the upper six
+    // bits of the eight-bit GRH/IP Traffic Class; ECN remains zero.
+    env_val = std::getenv(kRoceDscpEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        int64_t val = strtol(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0' && val >= 0 && val <= 63) {
+            roce_traffic_class_ = static_cast<uint8_t>(val << 2);
+            MPCOMM_LOG_INFO("MPComm: Using RoCE DSCP from %s: %ld (traffic_class=%u)\n",
+                            kRoceDscpEnvVar, static_cast<long>(val),
+                            static_cast<unsigned>(roce_traffic_class_));
+        } else {
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 0-63), using default DSCP 0\n",
+                            kRoceDscpEnvVar, env_val);
         }
     }
 
@@ -1066,6 +1338,35 @@ MPComm::Impl::Impl()
             MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s', using default 0 (every transfer)\n",
                     kTransferStatsIntervalEnvVar, env_val);
         }
+    }
+
+    // H2D post-rate QoS remains opt-in. Rate 0 is a valid pause policy.
+    env_val = std::getenv(kH2DQosRateEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        const uint64_t rate = strtoull(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0') {
+            h2d_qos_rate_bytes_per_sec_.store(rate, std::memory_order_relaxed);
+        } else {
+            MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s', using pause policy\n",
+                            kH2DQosRateEnvVar, env_val);
+        }
+    }
+    env_val = std::getenv(kH2DQosBurstEnvVar);
+    if (env_val && env_val[0] != '\0') {
+        char* endptr = nullptr;
+        const uint64_t burst = strtoull(env_val, &endptr, 10);
+        if (endptr != env_val && *endptr == '\0') {
+            h2d_qos_burst_bytes_.store(burst, std::memory_order_relaxed);
+        }
+    }
+    env_val = std::getenv(kH2DQosEnableEnvVar);
+    if (env_val && std::strcmp(env_val, "1") == 0) {
+        h2d_qos_enabled_.store(true, std::memory_order_relaxed);
+        MPCOMM_LOG_INFO("MPComm: H2D post-rate QoS enabled from environment "
+                        "(rate=%lu B/s, burst=%lu B)\n",
+                        static_cast<unsigned long>(h2d_qos_rate_bytes_per_sec_.load()),
+                        static_cast<unsigned long>(h2d_qos_burst_bytes_.load()));
     }
 }
 
@@ -1366,6 +1667,7 @@ shutdown():
 
 void MPComm::Impl::shutdown() {
     stopAcceptThread();
+    shutdownQosControlChannels();
 
     // Stop all worker threads first (they use busy-poll, just set flag and wait)
     if (worker_running_.load()) {
@@ -1704,7 +2006,7 @@ int MPComm::Impl::registerMemory(void *addr, size_t length) {
     // Discover PCIe-affine NICs for GPU memory (once, before registering on each NIC)
     std::vector<size_t> pcie_affine_nics;
     if (is_gpu) {
-        pcie_affine_nics = getGpuPcieAffinityNics(gpu_device_id);
+        pcie_affine_nics = getGpuPcieAffinityNicsCached(gpu_device_id);
     }
 
     // Register on all NICs
@@ -1816,6 +2118,19 @@ uint32_t MPComm::Impl::getRkey(size_t nic_index, void *addr) const {
     return 0;
 }
 
+int MPComm::Impl::getRemoteGpuDeviceForAddress(
+        const std::string& remote_host_id, uintptr_t remote_addr) const {
+    std::lock_guard<std::mutex> lock(connections_mutex_);
+    auto connection = connections_.find(remote_host_id);
+    if (connection == connections_.end()) return -1;
+    for (const auto& [base, buffer] : connection->second.remote_buffers) {
+        if (remote_addr >= base && remote_addr < base + buffer.length) {
+            return buffer.gpu_device_id;
+        }
+    }
+    return -1;
+}
+
 int MPComm::Impl::updateRemoteMemoryInfo(const std::string &remote_host_id,
                                    const std::vector<uint32_t> &rkeys) {
     std::lock_guard<std::mutex> lock(connections_mutex_);
@@ -1856,6 +2171,449 @@ std::vector<std::string> MPComm::Impl::getActiveDevices() const {
 
 size_t MPComm::Impl::getMaxRdmaTransferSize() const {
     return max_rdma_transfer_size_;
+}
+
+void MPComm::Impl::setNicThrottle(size_t max_outstanding_per_qp,
+                                  size_t chunk_size) {
+    throttle_outstanding_per_qp_.store(max_outstanding_per_qp,
+                                      std::memory_order_relaxed);
+    throttle_chunk_size_.store(chunk_size, std::memory_order_relaxed);
+    // Reset measurement slots before publishing the new epoch.
+    throttle_worker_seen_ns_.store(0, std::memory_order_relaxed);
+    throttle_drained_ns_.store(0, std::memory_order_relaxed);
+    throttle_snapshot_outstanding_wqes_.store(0, std::memory_order_relaxed);
+    throttle_drain_pending_.store(true, std::memory_order_relaxed);
+    throttle_enabled_.store(true, std::memory_order_relaxed);
+    uint64_t now = monotonicNowNs();
+    throttle_set_ns_.store(now, std::memory_order_relaxed);
+    // Release so workers observing the new epoch also see the values above.
+    throttle_epoch_.fetch_add(1, std::memory_order_release);
+    MPCOMM_LOG_INFO("MPComm: NIC throttle set (outstanding_per_qp=%zu, chunk=%zu)\n",
+                    max_outstanding_per_qp, chunk_size);
+}
+
+void MPComm::Impl::clearNicThrottle() {
+    throttle_drain_pending_.store(false, std::memory_order_relaxed);
+    throttle_enabled_.store(false, std::memory_order_relaxed);
+    throttle_outstanding_per_qp_.store(0, std::memory_order_relaxed);
+    throttle_chunk_size_.store(0, std::memory_order_relaxed);
+    throttle_epoch_.fetch_add(1, std::memory_order_release);
+    MPCOMM_LOG_INFO("MPComm: NIC throttle cleared\n");
+}
+
+namespace {
+
+uint64_t defaultQosBurstBytes(uint64_t rate_bytes_per_sec) {
+    if (rate_bytes_per_sec == 0) return 0;
+    constexpr uint64_t kMaxBurst = 64ULL * 1024ULL;
+    constexpr uint64_t kMinBurst = 4ULL * 1024ULL;
+    constexpr uint64_t kRefillPeriodsPerSecond = 10000;
+    const uint64_t target_burst = rate_bytes_per_sec / kRefillPeriodsPerSecond;
+    return std::min(kMaxBurst, std::max(kMinBurst, target_burst));
+}
+
+bool sendAllQos(int fd, const void* data, size_t bytes) {
+    const auto* cursor = static_cast<const char*>(data);
+    size_t sent = 0;
+    while (sent < bytes) {
+        const ssize_t rc = send(fd, cursor + sent, bytes - sent, MSG_NOSIGNAL);
+        if (rc <= 0) return false;
+        sent += static_cast<size_t>(rc);
+    }
+    return true;
+}
+
+bool consumeQosTokens(const std::shared_ptr<QosPacingPolicy>& policy, size_t bytes) {
+    // A missing policy must never gate posting. Guard against a null shared_ptr
+    // so a worker thread never dereferences an unset pacing policy (which would
+    // segfault the moment QoS is enabled).
+    if (!policy) return true;
+    std::lock_guard<std::mutex> lock(policy->mutex);
+    if (policy->rate_bytes_per_sec == 0) {
+        return false;  // Explicit pause: do not post a new WQE.
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (policy->last_refill.time_since_epoch().count() == 0) {
+        policy->last_refill = now;
+    } else {
+        const double elapsed = std::chrono::duration<double>(now - policy->last_refill).count();
+        const double capacity = static_cast<double>(std::max<uint64_t>(
+            policy->burst_bytes, static_cast<uint64_t>(bytes)));
+        policy->tokens = std::min(capacity, policy->tokens +
+            elapsed * static_cast<double>(policy->rate_bytes_per_sec));
+        policy->last_refill = now;
+    }
+
+    if (policy->tokens < static_cast<double>(bytes)) {
+        return false;
+    }
+    policy->tokens -= static_cast<double>(bytes);
+    return true;
+}
+
+}  // namespace
+
+QosControlFrame MPComm::Impl::makeQosControlFrame(
+        QosControlFrameType type, int gpu_device_id,
+        const std::vector<size_t>& affinity_nics, uint64_t rate_bytes_per_sec,
+        uint64_t burst_bytes, uint64_t generation) const {
+    QosControlFrame frame{};
+    frame.magic = kQosControlFrameMagic;
+    frame.version = kQosControlVersion;
+    frame.type = static_cast<uint32_t>(type);
+    frame.target_gpu_device = gpu_device_id;
+    frame.affinity_nic_count = static_cast<uint32_t>(
+        std::min(affinity_nics.size(), static_cast<size_t>(kMaxNics)));
+    for (uint32_t i = 0; i < frame.affinity_nic_count; ++i) {
+        frame.affinity_nic_indices[i] = static_cast<uint32_t>(affinity_nics[i]);
+    }
+    frame.rate_bytes_per_sec = rate_bytes_per_sec;
+    frame.burst_bytes = burst_bytes;
+    frame.generation = generation;
+    return frame;
+}
+
+void MPComm::Impl::enableH2DQoS(uint64_t rate_bytes_per_sec,
+                                uint64_t burst_bytes) {
+    setH2DQoSPolicy(rate_bytes_per_sec, burst_bytes);
+    h2d_qos_enabled_.store(true, std::memory_order_release);
+    MPCOMM_LOG_INFO("MPComm: H2D post-rate QoS enabled (rate=%lu B/s, burst=%lu B)\n",
+                    static_cast<unsigned long>(rate_bytes_per_sec),
+                    static_cast<unsigned long>(h2d_qos_burst_bytes_.load()));
+}
+
+void MPComm::Impl::setH2DQoSPolicy(uint64_t rate_bytes_per_sec,
+                                   uint64_t burst_bytes) {
+    if (burst_bytes == 0 && rate_bytes_per_sec != 0) {
+        burst_bytes = defaultQosBurstBytes(rate_bytes_per_sec);
+    }
+    h2d_qos_rate_bytes_per_sec_.store(rate_bytes_per_sec, std::memory_order_release);
+    h2d_qos_burst_bytes_.store(burst_bytes, std::memory_order_release);
+
+    // Create or update the single shared token bucket under h2d_qos_mutex_.
+    std::lock_guard<std::mutex> lock(h2d_qos_mutex_);
+    if (!shared_qos_bucket_) {
+        shared_qos_bucket_ = std::make_shared<QosPacingPolicy>();
+    }
+    std::lock_guard<std::mutex> pacing_lock(shared_qos_bucket_->mutex);
+    shared_qos_bucket_->rate_bytes_per_sec = rate_bytes_per_sec;
+    shared_qos_bucket_->burst_bytes = burst_bytes;
+    shared_qos_bucket_->tokens = 0.0;
+    shared_qos_bucket_->last_refill = std::chrono::steady_clock::now();
+}
+
+bool MPComm::Impl::isH2DQoSEnabled() const {
+    return h2d_qos_enabled_.load(std::memory_order_acquire);
+}
+
+void MPComm::Impl::beginH2DQoS(int gpu_device_id) {
+    // Simplified H2D QoS: pacing is governed solely by the global shared bucket
+    // and the enable/disable switch. tmaGather no longer calls this, and no
+    // per-GPU policy or control-channel broadcast is maintained here.
+    (void)gpu_device_id;
+}
+
+void MPComm::Impl::endH2DQoS(int gpu_device_id) {
+    // See beginH2DQoS: no-op in the simplified single-bucket design.
+    (void)gpu_device_id;
+}
+
+#ifdef USE_CUDA
+void MPComm::Impl::startH2DQosRestoreThread() {
+    bool expected = false;
+    if (!h2d_qos_restore_running_.compare_exchange_strong(expected, true)) {
+        return;  // already running
+    }
+    h2d_qos_restore_thread_ = std::thread(&MPComm::Impl::h2dQosRestoreLoop, this);
+}
+
+void MPComm::Impl::stopH2DQosRestoreThread() {
+    if (!h2d_qos_restore_running_.exchange(false)) return;
+    h2d_qos_restore_cv_.notify_all();
+    if (h2d_qos_restore_thread_.joinable()) {
+        h2d_qos_restore_thread_.join();
+    }
+    // Restore any leftover policies inline (host-only, no CUDA).
+    std::deque<H2DQosRestoreItem> leftover;
+    {
+        std::lock_guard<std::mutex> lock(h2d_qos_restore_mutex_);
+        leftover.swap(h2d_qos_restore_queue_);
+    }
+    for (auto& item : leftover) {
+        endH2DQoS(item.gpu_device_id);
+    }
+}
+
+void MPComm::Impl::h2dQosRestoreLoop() {
+    // Host-only loop: no CUDA API is ever called here. Each item carries a
+    // conservative wall-clock deadline; we sleep until then and lift pacing.
+    while (h2d_qos_restore_running_.load(std::memory_order_acquire)) {
+        H2DQosRestoreItem item{};
+        {
+            std::unique_lock<std::mutex> lock(h2d_qos_restore_mutex_);
+            h2d_qos_restore_cv_.wait(lock, [this] {
+                return !h2d_qos_restore_running_.load(std::memory_order_acquire) ||
+                       !h2d_qos_restore_queue_.empty();
+            });
+            if (!h2d_qos_restore_running_.load(std::memory_order_acquire) &&
+                h2d_qos_restore_queue_.empty()) {
+                return;
+            }
+            item = h2d_qos_restore_queue_.front();
+            h2d_qos_restore_queue_.pop_front();
+        }
+        // Wait until the item's deadline, but stay responsive to shutdown.
+        while (h2d_qos_restore_running_.load(std::memory_order_acquire)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= item.deadline) break;
+            std::unique_lock<std::mutex> lock(h2d_qos_restore_mutex_);
+            h2d_qos_restore_cv_.wait_until(lock, item.deadline);
+        }
+        endH2DQoS(item.gpu_device_id);
+    }
+}
+
+void MPComm::Impl::enqueueH2DQosRestore(int gpu_device_id) {
+    // Host-only: no CUDA event, no CUDA call. Pick a conservative deadline after
+    // which the H2D kernel is assumed complete and pacing may be lifted.
+    constexpr auto kRestoreDelay = std::chrono::milliseconds(50);
+    const auto deadline = std::chrono::steady_clock::now() + kRestoreDelay;
+    {
+        std::lock_guard<std::mutex> lock(h2d_qos_restore_mutex_);
+        h2d_qos_restore_queue_.push_back(H2DQosRestoreItem{deadline, gpu_device_id});
+    }
+    h2d_qos_restore_cv_.notify_one();
+}
+#endif
+
+void MPComm::Impl::disableH2DQoS() {
+    // Simplified: just flip the switch. The shared bucket is left intact; while
+    // disabled, tryConsumeLocalReadQosToken short-circuits to allow all posts.
+    h2d_qos_enabled_.store(false, std::memory_order_release);
+    MPCOMM_LOG_INFO("MPComm: H2D post-rate QoS disabled\n");
+}
+
+bool MPComm::Impl::tryConsumeRemoteQosToken(const std::string& peer_host_id,
+                                            int remote_gpu_device_id,
+                                            size_t remote_nic_index,
+                                            size_t bytes) {
+    // Simplified single-bucket design does not pace remote WRITEs. Always allow.
+    (void)peer_host_id;
+    (void)remote_gpu_device_id;
+    (void)remote_nic_index;
+    (void)bytes;
+    return true;
+}
+
+bool MPComm::Impl::tryConsumeLocalReadQosToken(int local_gpu_device_id,
+                                               size_t local_nic_index,
+                                               size_t bytes) {
+    // Simplified: any local GATHER/READ post consumes from the single shared
+    // token bucket while H2D QoS is enabled. No per-GPU or NIC-affinity match.
+    (void)local_gpu_device_id;
+    (void)local_nic_index;
+    if (!isH2DQoSEnabled()) return true;
+    std::shared_ptr<QosPacingPolicy> policy;
+    {
+        std::lock_guard<std::mutex> lock(h2d_qos_mutex_);
+        policy = shared_qos_bucket_;
+    }
+    return consumeQosTokens(policy, bytes);
+}
+
+bool MPComm::Impl::openQosControlChannel(const std::string& remote_host_id,
+                                         const std::string& remote_tcp_addr,
+                                         int remote_tcp_port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        MPCOMM_LOG_WARN("MPComm: QoS control socket creation failed: %s\n", strerror(errno));
+        return false;
+    }
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(remote_tcp_port);
+    if (inet_pton(AF_INET, remote_tcp_addr.c_str(), &addr.sin_addr) <= 0) {
+        struct hostent* he = gethostbyname(remote_tcp_addr.c_str());
+        if (!he) {
+            close(fd);
+            return false;
+        }
+        memcpy(&addr.sin_addr, he->h_addr, he->h_length);
+    }
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        MPCOMM_LOG_WARN("MPComm: QoS control connection unavailable: %s\n", strerror(errno));
+        close(fd);
+        return false;
+    }
+    int flag = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    const uint32_t msg_type = kMsgTypeQosControlOpen;
+    QosControlHello hello{};
+    hello.version = kQosControlVersion;
+    strncpy(hello.host_id, local_host_id_.c_str(), sizeof(hello.host_id) - 1);
+    if (!sendAllQos(fd, &msg_type, sizeof(msg_type)) ||
+        !sendAllQos(fd, &hello, sizeof(hello))) {
+        MPCOMM_LOG_WARN("MPComm: QoS control hello failed: %s\n", strerror(errno));
+        close(fd);
+        return false;
+    }
+    startQosControlChannel(fd, remote_host_id);
+    return true;
+}
+
+void MPComm::Impl::startQosControlChannel(int fd, const std::string& peer_host_id) {
+    auto channel = std::make_shared<QosControlChannel>();
+    channel->fd.store(fd, std::memory_order_release);
+    channel->peer_host_id = peer_host_id;
+
+    std::shared_ptr<QosControlChannel> previous;
+    {
+        std::lock_guard<std::mutex> lock(qos_channels_mutex_);
+        auto it = qos_channels_.find(peer_host_id);
+        if (it != qos_channels_.end()) previous = it->second;
+        qos_channels_[peer_host_id] = channel;
+        qos_receiver_threads_.emplace_back(&MPComm::Impl::qosControlReceiveLoop,
+                                            this, channel);
+    }
+    if (previous) {
+        previous->running.store(false, std::memory_order_release);
+        const int previous_fd = previous->fd.load(std::memory_order_acquire);
+        if (previous_fd >= 0) ::shutdown(previous_fd, SHUT_RDWR);
+    }
+}
+
+void MPComm::Impl::qosControlReceiveLoop(std::shared_ptr<QosControlChannel> channel) {
+    while (channel->running.load(std::memory_order_acquire)) {
+        QosControlFrame frame{};
+        const int fd = channel->fd.load(std::memory_order_acquire);
+        if (fd < 0) break;
+        const ssize_t received = recv(fd, &frame, sizeof(frame), MSG_WAITALL);
+        if (received != static_cast<ssize_t>(sizeof(frame)) ||
+            frame.magic != kQosControlFrameMagic ||
+            frame.version != kQosControlVersion ||
+            frame.affinity_nic_count > kMaxNics) {
+            break;
+        }
+        applyRemoteQosPolicy(channel->peer_host_id, frame);
+    }
+    channel->running.store(false, std::memory_order_release);
+    const int fd = channel->fd.exchange(-1, std::memory_order_acq_rel);
+    if (fd >= 0) {
+        close(fd);
+    }
+    // Fail open: if a peer control path disappears, never leave its writes
+    // permanently paused on this node.
+    clearRemoteQosPolicies(channel->peer_host_id);
+}
+
+void MPComm::Impl::shutdownQosControlChannels() {
+    std::vector<std::shared_ptr<QosControlChannel>> channels;
+    std::vector<std::thread> receivers;
+    {
+        std::lock_guard<std::mutex> lock(qos_channels_mutex_);
+        for (const auto& [_, channel] : qos_channels_) channels.push_back(channel);
+        qos_channels_.clear();
+        receivers.swap(qos_receiver_threads_);
+    }
+    for (const auto& channel : channels) {
+        channel->running.store(false, std::memory_order_release);
+        const int fd = channel->fd.load(std::memory_order_acquire);
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+    }
+    for (auto& receiver : receivers) {
+        if (receiver.joinable()) receiver.join();
+    }
+    std::lock_guard<std::mutex> lock(remote_qos_policies_mutex_);
+    remote_qos_policies_.clear();
+    remote_qos_policy_active_.store(false, std::memory_order_release);
+}
+
+bool MPComm::Impl::sendQosControlFrame(const std::string& peer_host_id,
+                                       const QosControlFrame& frame) {
+    std::shared_ptr<QosControlChannel> channel;
+    {
+        std::lock_guard<std::mutex> lock(qos_channels_mutex_);
+        auto it = qos_channels_.find(peer_host_id);
+        if (it == qos_channels_.end()) return false;
+        channel = it->second;
+    }
+    if (!channel->running.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> send_lock(channel->send_mutex);
+    const int fd = channel->fd.load(std::memory_order_acquire);
+    if (fd < 0 || !sendAllQos(fd, &frame, sizeof(frame))) {
+        channel->running.store(false, std::memory_order_release);
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+        return false;
+    }
+    return true;
+}
+
+void MPComm::Impl::broadcastQosControlFrame(const QosControlFrame& frame) {
+    std::vector<std::string> peers;
+    {
+        std::lock_guard<std::mutex> lock(qos_channels_mutex_);
+        peers.reserve(qos_channels_.size());
+        for (const auto& [peer, _] : qos_channels_) peers.push_back(peer);
+    }
+    for (const auto& peer : peers) {
+        sendQosControlFrame(peer, frame);
+    }
+}
+
+void MPComm::Impl::applyRemoteQosPolicy(const std::string& peer_host_id,
+                                        const QosControlFrame& frame) {
+    std::lock_guard<std::mutex> lock(remote_qos_policies_mutex_);
+    auto& per_gpu = remote_qos_policies_[peer_host_id];
+    const int gpu = frame.target_gpu_device;
+    if (frame.type == static_cast<uint32_t>(QosControlFrameType::kClear)) {
+        per_gpu.erase(gpu);
+        if (per_gpu.empty()) remote_qos_policies_.erase(peer_host_id);
+        remote_qos_policy_active_.store(!remote_qos_policies_.empty(),
+                                        std::memory_order_release);
+        return;
+    }
+    if (frame.type != static_cast<uint32_t>(QosControlFrameType::kUpdate)) return;
+
+    auto& policy = per_gpu[gpu];
+    if (!policy) policy = std::make_shared<QosPacingPolicy>();
+    std::lock_guard<std::mutex> policy_lock(policy->mutex);
+    if (frame.generation < policy->generation) return;
+    policy->rate_bytes_per_sec = frame.rate_bytes_per_sec;
+    policy->burst_bytes = frame.burst_bytes == 0 && frame.rate_bytes_per_sec != 0
+        ? defaultQosBurstBytes(frame.rate_bytes_per_sec) : frame.burst_bytes;
+    policy->generation = frame.generation;
+    policy->affinity_nics.clear();
+    for (uint32_t i = 0; i < frame.affinity_nic_count; ++i) {
+        policy->affinity_nics.push_back(frame.affinity_nic_indices[i]);
+    }
+    policy->tokens = 0.0;
+    policy->last_refill = std::chrono::steady_clock::now();
+    remote_qos_policy_active_.store(true, std::memory_order_release);
+}
+
+void MPComm::Impl::clearRemoteQosPolicies(const std::string& peer_host_id) {
+    std::lock_guard<std::mutex> lock(remote_qos_policies_mutex_);
+    remote_qos_policies_.erase(peer_host_id);
+    remote_qos_policy_active_.store(!remote_qos_policies_.empty(),
+                                    std::memory_order_release);
+}
+
+bool MPComm::Impl::getThrottleLatency(uint64_t* set_ns,
+                                      uint64_t* worker_seen_ns,
+                                      uint64_t* drained_ns,
+                                      size_t* snapshot_outstanding_wqes) const {
+    uint64_t drained = throttle_drained_ns_.load(std::memory_order_acquire);
+    if (set_ns) *set_ns = throttle_set_ns_.load(std::memory_order_relaxed);
+    if (worker_seen_ns) {
+        *worker_seen_ns = throttle_worker_seen_ns_.load(std::memory_order_relaxed);
+    }
+    if (drained_ns) *drained_ns = drained;
+    if (snapshot_outstanding_wqes) {
+        *snapshot_outstanding_wqes =
+            throttle_snapshot_outstanding_wqes_.load(std::memory_order_relaxed);
+    }
+    return drained != 0;
 }
 
 size_t MPComm::Impl::getQpsPerConnection() const {
@@ -2361,8 +3119,11 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
             // Update existing entry
             entry.length = length;
             entry.numa_node = (numa_node >= 0) ? numa_node : getNumaNodeForAddr(addr);
-            MPCOMM_LOG_INFO("MPComm: Updated published buffer addr=%p, length=%zu, numa=%d\n",
-                   addr, length, entry.numa_node);
+            entry.gpu_device_id = detectGpuDevice(addr);
+            entry.pcie_affine_nic_indices = entry.gpu_device_id >= 0
+                ? getGpuPcieAffinityNicsCached(entry.gpu_device_id) : std::vector<size_t>{};
+            MPCOMM_LOG_INFO("MPComm: Updated published buffer addr=%p, length=%zu, numa=%d, gpu=%d\n",
+                   addr, length, entry.numa_node, entry.gpu_device_id);
             return MPCOMM_SUCCESS;
         }
     }
@@ -2372,6 +3133,10 @@ int MPComm::Impl::publishBuffer(void *addr, size_t length, int numa_node) {
     entry.addr = buf_addr;
     entry.length = length;
     entry.numa_node = (numa_node >= 0) ? numa_node : getNumaNodeForAddr(addr);
+    entry.gpu_device_id = detectGpuDevice(addr);
+    if (entry.gpu_device_id >= 0) {
+        entry.pcie_affine_nic_indices = getGpuPcieAffinityNicsCached(entry.gpu_device_id);
+    }
 
     // Get rkeys for all NICs
     entry.rkeys.reserve(nic_contexts_.size());
@@ -2556,6 +3321,29 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
         }
         entry.numa_node = numa_node;
 
+        int32_t gpu_device_id = -1;
+        uint32_t affinity_nic_count = 0;
+        if (recv(sock_fd, &gpu_device_id, sizeof(gpu_device_id), MSG_WAITALL) !=
+                sizeof(gpu_device_id) ||
+            recv(sock_fd, &affinity_nic_count, sizeof(affinity_nic_count), MSG_WAITALL) !=
+                sizeof(affinity_nic_count) || affinity_nic_count > kMaxNics) {
+            MPCOMM_PLOG_ERROR("MPComm: Failed to receive buffer GPU QoS metadata");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+        entry.gpu_device_id = gpu_device_id;
+        entry.pcie_affine_nic_indices.resize(affinity_nic_count);
+        for (uint32_t i = 0; i < affinity_nic_count; ++i) {
+            uint32_t nic_index = 0;
+            if (recv(sock_fd, &nic_index, sizeof(nic_index), MSG_WAITALL) !=
+                sizeof(nic_index)) {
+                MPCOMM_PLOG_ERROR("MPComm: Failed to receive buffer affinity NIC");
+                close(sock_fd);
+                return MPCOMM_ERR_CONNECTION;
+            }
+            entry.pcie_affine_nic_indices[i] = nic_index;
+        }
+
         // Receive rkeys for each NIC
         entry.rkeys.resize(num_nics);
         for (uint32_t nic_idx = 0; nic_idx < num_nics; ++nic_idx) {
@@ -2600,6 +3388,8 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
                 reordered_entry.addr = buf.addr;
                 reordered_entry.length = buf.length;
                 reordered_entry.numa_node = buf.numa_node;
+                reordered_entry.gpu_device_id = buf.gpu_device_id;
+                reordered_entry.pcie_affine_nic_indices = buf.pcie_affine_nic_indices;
                 reordered_entry.rkeys.resize(conn_it->second.nic_endpoints.size());
 
                 // Reorder rkeys to match local NIC endpoint indices
@@ -2744,11 +3534,30 @@ void MPComm::Impl::handleBufferQuery(int client_fd) {
             return;
         }
 
-        // Send NUMA node
+        // Send NUMA node.
         int32_t numa_node = entry.numa_node;
         if (send(client_fd, &numa_node, sizeof(numa_node), 0) != sizeof(numa_node)) {
             MPCOMM_PLOG_ERROR("MPComm: Failed to send NUMA node");
             return;
+        }
+
+        // Send destination-GPU metadata used by remote WRITE pacing.
+        const int32_t gpu_device_id = entry.gpu_device_id;
+        const uint32_t affinity_nic_count = static_cast<uint32_t>(
+            std::min(entry.pcie_affine_nic_indices.size(), static_cast<size_t>(kMaxNics)));
+        if (send(client_fd, &gpu_device_id, sizeof(gpu_device_id), 0) !=
+                sizeof(gpu_device_id) ||
+            send(client_fd, &affinity_nic_count, sizeof(affinity_nic_count), 0) !=
+                sizeof(affinity_nic_count)) {
+            MPCOMM_PLOG_ERROR("MPComm: Failed to send buffer GPU QoS metadata");
+            return;
+        }
+        for (uint32_t i = 0; i < affinity_nic_count; ++i) {
+            const uint32_t nic_index = static_cast<uint32_t>(entry.pcie_affine_nic_indices[i]);
+            if (send(client_fd, &nic_index, sizeof(nic_index), 0) != sizeof(nic_index)) {
+                MPCOMM_PLOG_ERROR("MPComm: Failed to send buffer affinity NIC");
+                return;
+            }
         }
 
         // Send rkeys for each NIC
@@ -2830,6 +3639,7 @@ int MPComm::Impl::modifyQPToRTR(NicContext &ctx, struct ibv_qp *qp,
     stringToGid(remote.gid, attr.ah_attr.grh.dgid);
     attr.ah_attr.grh.sgid_index = ctx.gid_index;
     attr.ah_attr.grh.hop_limit = kMaxHopLimit;
+    attr.ah_attr.grh.traffic_class = roce_traffic_class_;
     attr.ah_attr.dlid = remote.lid;
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
@@ -3348,6 +4158,9 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         connections_[remote_host_id] = conn_info;
     }
 
+    // Simplified H2D QoS paces only local GATHER/READ posts, so no persistent
+    // QoS control channel is established here.
+
     if (skipped_connections > 0) {
         MPCOMM_LOG_WARN("MPComm: Connected to %s with %zu NIC connections "
                         "(%zu skipped due to unreachable NICs), %zu QPs each\n",
@@ -3431,8 +4244,17 @@ void MPComm::Impl::acceptLoop() {
         }
 
         if (msg_type == kMsgTypeBufferQuery) {
-            // Handle buffer query request
+            // Handle buffer query request.
             handleBufferQuery(client_fd);
+            close(client_fd);
+            continue;
+        }
+
+        if (msg_type == kMsgTypeQosControlOpen) {
+            // Simplified H2D QoS does not use a control channel. Reject politely
+            // so a peer running the full protocol simply falls back to fail-open.
+            MPCOMM_LOG_WARN("MPComm: QoS control channel not supported in this "
+                            "build; closing\n");
             close(client_fd);
             continue;
         }
@@ -3942,6 +4764,12 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
         return INVALID_TRANSFER_HANDLE;
     }
     ctx->local_addr = local_addr;
+    if (direction == TransferDirection::GATHER) {
+        // The worker needs only the destination GPU ordinal. NIC affinity is
+        // resolved from the registered memory metadata below, so do not repeat
+        // CUDA/sysfs topology discovery for every background GET transfer.
+        ctx->local_gpu_device_id = detectGpuDevice(reinterpret_cast<void*>(local_addr));
+    }
     ctx->host_list = host_list;
     ctx->remote_addrs = remote_addrs;
     ctx->lengths = lengths;
@@ -3949,7 +4777,9 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     ctx->start_time = std::chrono::steady_clock::now();
 
     // Prepare all chunks (same logic as transferImplDynamic)
-    const size_t max_chunk_size = max_rdma_transfer_size_;
+    // Uses the runtime-effective chunk size so a throttle change applies to
+    // every newly created transfer.
+    const size_t max_chunk_size = effectiveChunkSize();
     size_t total_chunks = 0;
 
     // Calculate total chunks and local offsets
@@ -4859,9 +5689,18 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
            worker_id, numa_id, static_cast<uint64_t>(pthread_self()));
 
     const size_t kMaxIdleSpins = max_idle_spins_;
-    const size_t max_outstanding_per_nic = max_outstanding_per_qp_ * qps_per_connection_;
-    const size_t kMaxOutstandingPerQP = max_outstanding_per_qp_;
+    // Effective flow-control limits are re-read every loop iteration so that a
+    // runtime throttle change takes effect without restarting the worker.
+    size_t max_outstanding_per_nic = effectiveOutstandingPerQp() * qps_per_connection_;
+    size_t kMaxOutstandingPerQP = effectiveOutstandingPerQp();
     size_t num_nics = nic_contexts_.size();
+
+    // Throttle bookkeeping: when a new epoch is observed we snapshot the
+    // per-QP posted counters so we can detect when all pre-throttle WQEs
+    // have been completed (drain watermark).
+    uint64_t seen_throttle_epoch = throttle_epoch_.load(std::memory_order_acquire);
+    bool drain_watch_active = false;
+    size_t drain_watermark[kMaxNics][kMaxQPsPerNic] = {};
 
     // Worker-level outstanding tracking (shared across all active contexts on this worker).
     // These track the ACTUAL NIC-level outstanding WRs, which is what matters for flow control
@@ -5113,6 +5952,9 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     break;
                 }
 
+                // Simplified H2D QoS paces only local GATHER/READ posts, so the
+                // PXN proxy WRITE path is never throttled here.
+
                 struct ibv_sge p_sge;
                 memset(&p_sge, 0, sizeof(p_sge));
                 p_sge.addr = static_cast<uint64_t>(cc.proxy_addr);
@@ -5325,6 +6167,62 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
         // is global, so we must use a global assigned_outstanding to correctly decompose
         // the pipeline into NVLink vs RDMA stages.
         size_t global_proxy_assigned[kMaxNics] = {};
+        // ---- Runtime throttle: detect policy change and refresh limits ----
+        // An idle NUMA worker has no WQEs to throttle. It must not claim t3/t4
+        // with an all-zero watermark before the worker that owns the transfer
+        // observes the policy.
+        bool has_active_transfer = false;
+        for (const auto& ac : active_contexts) {
+            if (!ac.ctx->finished.load(std::memory_order_relaxed)) {
+                has_active_transfer = true;
+                break;
+            }
+        }
+        uint64_t current_epoch = throttle_epoch_.load(std::memory_order_acquire);
+        if (has_active_transfer && current_epoch != seen_throttle_epoch) {
+            seen_throttle_epoch = current_epoch;
+            kMaxOutstandingPerQP = effectiveOutstandingPerQp();
+            max_outstanding_per_nic = kMaxOutstandingPerQP * qps_per_connection_;
+            // t3: first moment the worker owning an active transfer observed
+            // the new policy.
+            uint64_t zero = 0;
+            throttle_worker_seen_ns_.compare_exchange_strong(
+                zero, monotonicNowNs(), std::memory_order_relaxed);
+            // Snapshot posted counters as the drain watermark and record the
+            // real outstanding WQE count at t3 for sample validation.
+            if (throttle_drain_pending_.load(std::memory_order_relaxed)) {
+                size_t outstanding_wqes = 0;
+                for (size_t n = 0; n < num_nics && n < kMaxNics; ++n) {
+                    for (size_t q = 0; q < qps_per_connection_ && q < kMaxQPsPerNic; ++q) {
+                        drain_watermark[n][q] = worker_nic_qp_posted[n][q];
+                        outstanding_wqes += worker_nic_qp_posted[n][q] -
+                                             worker_nic_qp_completed[n][q];
+                    }
+                }
+                throttle_snapshot_outstanding_wqes_.store(
+                    outstanding_wqes, std::memory_order_relaxed);
+                drain_watch_active = true;
+            }
+        }
+        if (drain_watch_active) {
+            bool all_drained = true;
+            for (size_t n = 0; n < num_nics && n < kMaxNics && all_drained; ++n) {
+                for (size_t q = 0; q < qps_per_connection_ && q < kMaxQPsPerNic; ++q) {
+                    if (worker_nic_qp_completed[n][q] < drain_watermark[n][q]) {
+                        all_drained = false;
+                        break;
+                    }
+                }
+            }
+            if (all_drained) {
+                // t4: every WQE posted before the throttle has completed.
+                uint64_t zero = 0;
+                throttle_drained_ns_.compare_exchange_strong(
+                    zero, monotonicNowNs(), std::memory_order_release);
+                drain_watch_active = false;
+            }
+        }
+
         size_t num_active_pxn_transfers = 0;
         for (const auto& ac : active_contexts) {
             const TransferContext& actx = *ac.ctx;
@@ -5386,9 +6284,27 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             // NVLink copy + deferred RDMA posting. Interleave proxy RDMA posting
             // periodically to keep proxy NICs' RDMA queues fed.
             size_t post_batch_count = 0;
+            // A paced chunk is deferred rather than blocking the worker. Prefer
+            // unseen chunks first so another peer/GPU flow can still make
+            // progress; after the initial scan, retry a bounded number of
+            // deferred chunks in each worker round.
+            size_t pacing_skip_count = 0;
+            static constexpr size_t kMaxPacingSkipsPerContext = 64;
             auto t_direct0 = std::chrono::steady_clock::now();
-            while (ctx.next_chunk_idx.load() < total_chunks) {
-                size_t chunk_idx = ctx.next_chunk_idx.load();
+            while (ctx.next_chunk_idx.load() < total_chunks ||
+                   !ctx.deferred_chunk_indices.empty()) {
+                // Do not consume an unseen chunk until it has been assigned to
+                // a proxy pipeline or successfully posted. A full NIC/QP must
+                // leave the current chunk untouched for the next worker round.
+                size_t chunk_idx;
+                bool chunk_from_deferred = false;
+                if (ctx.next_chunk_idx.load() < total_chunks) {
+                    chunk_idx = ctx.next_chunk_idx.load();
+                } else {
+                    chunk_idx = ctx.deferred_chunk_indices.front();
+                    ctx.deferred_chunk_indices.pop_front();
+                    chunk_from_deferred = true;
+                }
 
 #ifdef USE_CUDA
                 static constexpr size_t kPostBatchBeforeProxyRdma = 16;
@@ -5486,10 +6402,12 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                             pp.total_bytes_assigned += chunk.length;
                             pp.assigned_outstanding++;
                             global_proxy_assigned[best_nic]++;  // Keep global snapshot in sync
+                            if (!chunk_from_deferred) {
+                                ctx.next_chunk_idx.fetch_add(1);
+                            }
                             break;
                         }
                     }
-                    ctx.next_chunk_idx.fetch_add(1);
                     post_batch_count++;
                     continue;  // No direct RDMA post — chunk goes through NVLink copy pipeline
                 }
@@ -5571,6 +6489,27 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                     break;  // Skip this context, will be removed in Phase 4
                 }
 
+                // Simplified H2D QoS: only local GATHER/READ posts are paced,
+                // against a single shared token bucket. A token-starved chunk is
+                // deferred instead of blocking the worker, so other transfers
+                // keep making progress.
+                bool pacing_allowed = true;
+                if (ctx.direction == TransferDirection::GATHER) {
+                    pacing_allowed = tryConsumeLocalReadQosToken(
+                        ctx.local_gpu_device_id, best_nic, chunk.length);
+                }
+                if (!pacing_allowed) {
+                    ctx.deferred_chunk_indices.push_back(chunk_idx);
+                    if (!chunk_from_deferred) {
+                        ctx.next_chunk_idx.fetch_add(1);
+                    }
+                    if (++pacing_skip_count >= kMaxPacingSkipsPerContext) {
+                        break;
+                    }
+                    continue;
+                }
+                pacing_skip_count = 0;
+
                 // Prepare and post RDMA WR
                 struct ibv_sge sge;
                 memset(&sge, 0, sizeof(sge));
@@ -5607,7 +6546,9 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 ctx.per_nic_posted[best_nic]++;
                 ctx.per_nic_qp_posted[best_nic][qp_index]++;
                 ctx.per_nic_bytes[best_nic] += chunk.length;
-                ctx.next_chunk_idx.fetch_add(1);
+                if (!chunk_from_deferred) {
+                    ctx.next_chunk_idx.fetch_add(1);
+                }
                 post_batch_count++;
                 diag_iter_direct_posted++;
 
@@ -5644,6 +6585,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             // Record all_posted_time when all direct chunks have been posted (only once)
             total_chunks = ctx.total_chunks.load();
             if (ctx.next_chunk_idx.load() >= total_chunks &&
+                ctx.deferred_chunk_indices.empty() &&
                 ctx.all_posted_time.time_since_epoch().count() == 0) {
                 ctx.all_posted_time = std::chrono::steady_clock::now();
             }
@@ -6065,6 +7007,12 @@ int MPComm::Impl::pollAllNicsForWorker(
                 if (completed_qp < qps_per_connection_) {
                     target_ctx->per_nic_qp_completed[completed_nic][completed_qp]++;
                 }
+                // Accumulate NIC->GPU completed bytes for windowed bandwidth
+                // measurement. One successful CQE == one chunk of max_chunk_size
+                // (the trailing chunk may be smaller; negligible for large
+                // transfers split into many equal chunks).
+                nic_completed_bytes_.fetch_add(target_ctx->max_chunk_size,
+                std::memory_order_relaxed);
                 // Decrement assigned_outstanding for proxy NIC pipelines
                 if (target_ctx->pxn_enabled && target_ctx->pxn_is_proxy_nic[completed_nic]) {
                     for (auto& pp : target_ctx->pxn_proxy_pipelines) {
@@ -6411,6 +7359,43 @@ size_t MPComm::getMaxRdmaTransferSize() const {
     return impl_->getMaxRdmaTransferSize();
 }
 
+void MPComm::setNicThrottle(size_t max_outstanding_per_qp, size_t chunk_size) {
+    impl_->setNicThrottle(max_outstanding_per_qp, chunk_size);
+}
+
+void MPComm::clearNicThrottle() {
+    impl_->clearNicThrottle();
+}
+
+bool MPComm::getThrottleLatency(uint64_t* set_ns, uint64_t* worker_seen_ns,
+                                uint64_t* drained_ns,
+                                size_t* snapshot_outstanding_wqes) const {
+    return impl_->getThrottleLatency(set_ns, worker_seen_ns, drained_ns,
+                                     snapshot_outstanding_wqes);
+}
+
+void MPComm::enableH2DQoS(uint64_t rate_bytes_per_sec,
+                           uint64_t burst_bytes) {
+    impl_->enableH2DQoS(rate_bytes_per_sec, burst_bytes);
+}
+
+void MPComm::setH2DQoSPolicy(uint64_t rate_bytes_per_sec,
+                              uint64_t burst_bytes) {
+    impl_->setH2DQoSPolicy(rate_bytes_per_sec, burst_bytes);
+}
+
+bool MPComm::isH2DQoSEnabled() const {
+    return impl_->isH2DQoSEnabled();
+}
+
+void MPComm::disableH2DQoS() {
+    impl_->disableH2DQoS();
+}
+
+uint64_t MPComm::getNicCompletedBytes() const {
+    return impl_->getNicCompletedBytes();
+}
+
 size_t MPComm::getQpsPerConnection() const {
     return impl_->getQpsPerConnection();
 }
@@ -6561,6 +7546,9 @@ int MPComm::Impl::tmaGather(uintptr_t dram_dev_ptr, const int64_t *indices,
         return MPCOMM_ERR_INVALID_ARG;
     }
 
+    // Simplified H2D QoS: pacing is controlled purely by enable_h2d_qos /
+    // disable_h2d_qos from the caller. tmaGather only launches the kernel and
+    // never touches CUDA callbacks, restore threads or per-GPU policies.
     launch_tma_gather_kernel(
         reinterpret_cast<const char *>(dram_dev_ptr),
         indices,

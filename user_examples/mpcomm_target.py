@@ -100,7 +100,7 @@ def _format_bytes(num_bytes: int) -> str:
 
 
 class MPCommTargetServer:
-    """Target server that maintains a DDR buffer for RDMA operations."""
+    """Target server that publishes either a CPU-DRAM or GPU-HBM RDMA buffer."""
 
     def __init__(
         self,
@@ -109,14 +109,21 @@ class MPCommTargetServer:
         tcp_port: int,
         device_name: str,
         buffer_size: int,
+        gpu_id: Optional[int],
         verbose: bool,
     ) -> None:
         self.host_id = host_id
         self.tcp_port = tcp_port
         self.device_name = device_name
         self.buffer_size = buffer_size
+        self.gpu_id = gpu_id
         self.verbose = verbose
         self._stop_requested = False
+
+        if self.gpu_id is not None:
+            if not torch.cuda.is_available():
+                raise RuntimeError("--gpu requires CUDA, but CUDA is unavailable")
+            torch.cuda.set_device(self.gpu_id)
 
         # Initialize MPComm
         self.comm = mpcomm.MPComm()
@@ -131,13 +138,18 @@ class MPCommTargetServer:
         for i in range(self.comm.get_num_nics()):
             print(f"  NIC {i}: GID={self.comm.get_gid(i)}")
 
-        # Allocate and register buffer
+        # Allocate and register buffer.
         self._tensor: Optional[torch.Tensor] = None
         self.buffer_addr = self._allocate_buffer()
         self._ipv4_bytes = _resolve_ipv4_bytes(host_id)
 
-        # Initialize buffer with IPv4 pattern
-        self._initialize_buffer_pattern()
+        # The verification seed uses a CPU memcpy and is therefore valid only
+        # for a DRAM target. A GPU target is intended for remote RDMA WRITE and
+        # is initialized by CUDA instead.
+        if self.gpu_id is None:
+            self._initialize_buffer_pattern()
+        else:
+            self._tensor.zero_()
 
         # Publish buffer for remote queries
         ret = self.comm.publish_buffer(self.buffer_addr, self.buffer_size)
@@ -145,18 +157,24 @@ class MPCommTargetServer:
             raise RuntimeError(f"Failed to publish buffer: {ret}")
 
     def _allocate_buffer(self) -> int:
-        """Allocate a tensor buffer and register it for RDMA."""
-        tensor = torch.empty(self.buffer_size, dtype=torch.uint8)
+        """Allocate a CPU-DRAM or GPU-HBM tensor and register it for RDMA."""
+        device = "cpu" if self.gpu_id is None else f"cuda:{self.gpu_id}"
+        tensor = torch.empty(self.buffer_size, dtype=torch.uint8, device=device)
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         addr = tensor.data_ptr()
 
         ret = self.comm.register_memory(addr, self.buffer_size)
         if ret != 0:
-            raise RuntimeError(f"Failed to register memory: {ret}")
+            memory_kind = "GPU HBM" if self.gpu_id is not None else "CPU DRAM"
+            raise RuntimeError(
+                f"Failed to register {memory_kind} with RDMA: {ret}; "
+                "check nvidia-peermem for GPU memory")
 
         self._tensor = tensor
-        print(f"[target] Registered buffer at 0x{addr:x} ({_format_bytes(self.buffer_size)})")
+        memory_kind = "CPU DRAM" if self.gpu_id is None else f"GPU {self.gpu_id} HBM"
+        print(f"[target] Registered {memory_kind} at 0x{addr:x} "
+              f"({_format_bytes(self.buffer_size)})")
         return addr
 
     def _initialize_buffer_pattern(self) -> None:
@@ -218,6 +236,7 @@ class MPCommTargetServer:
         print(f"  TCP Address:  {info['tcp_addr']}:{info['tcp_port']}")
         print(f"  Buffer Addr:  0x{info['buffer_addr']:x}")
         print(f"  Buffer Size:  {_format_bytes(info['buffer_size'])}")
+        print(f"  Buffer Type:  {'CPU DRAM' if self.gpu_id is None else f'GPU {self.gpu_id} HBM'}")
         print(f"  Num NICs:     {info['num_nics']}")
         print(f"  RKeys:        {info['rkeys']}")
         print("=" * 60)
@@ -539,6 +558,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--gpu",
+        type=int,
+        default=-1,
+        help="Publish a GPU-HBM buffer on this CUDA device; -1 publishes CPU DRAM (default)",
+    )
+
+    parser.add_argument(
         "--num-numas",
         type=str,
         default="0",
@@ -589,6 +615,9 @@ def main() -> None:
     numa_nodes_str = args.num_numas.strip()
     numa_nodes = [int(n.strip()) for n in numa_nodes_str.split(",") if n.strip()]
 
+    if args.gpu >= 0 and len(numa_nodes) > 1:
+        raise SystemExit("--gpu cannot be combined with multi-NUMA target buffers")
+
     if len(numa_nodes) > 1:
         print(f"[main] Starting Multi-NUMA target server with NUMA nodes: {numa_nodes}")
         target = MultiNumaTargetServer(
@@ -605,6 +634,7 @@ def main() -> None:
             tcp_port=args.tcp_port,
             device_name=args.device,
             buffer_size=buffer_size,
+            gpu_id=args.gpu if args.gpu >= 0 else None,
             verbose=args.verbose,
         )
 

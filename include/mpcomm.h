@@ -68,13 +68,30 @@ enum H2DMode {
     H2D_MODE_TMA  = 2,   // Hopper TMA engine (cp.async.bulk via Smem)
 };
 
-// Maximum size for a single RDMA transfer (default: 1 GB)
+// Maximum size for a single RDMA transfer (default: 128 KiB)
 // Can be configured via environment variable MPCOMM_MAX_RDMA_TRANSFER_SIZE
-static constexpr size_t MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE = 1ULL << 30;
+//
+// Rationale: one chunk == one WQE, and a WQE cannot be revoked once posted.
+// The chunk size therefore bounds the residual PCIe occupancy that a competing
+// H2D (TMA) window must wait out:  T_residual >= chunk_size / BW_pcie.
+// At ~50 GB/s, 128 KiB is ~2.5 us, which fits inside a 30-50 us H2D window;
+// the historical 1 GiB default was ~21 ms and made any admission control moot.
+// Set MPCOMM_MAX_RDMA_TRANSFER_SIZE=1073741824 to reproduce the old behavior.
+static constexpr size_t MPCOMM_DEFAULT_MAX_RDMA_TRANSFER_SIZE = 128ULL << 10;
 
-// Number of QPs per NIC per connection (default: 1)
+// Number of QPs per NIC per connection (default: 4)
 // Can be configured via environment variable MPCOMM_QPS_PER_CONNECTION
-static constexpr size_t MPCOMM_DEFAULT_QPS_PER_CONNECTION = 1;
+//
+// Raised from 1 to keep the NIC pipeline deep enough after the chunk size was
+// reduced to 128 KiB. Set MPCOMM_QPS_PER_CONNECTION=1 for the old behavior.
+static constexpr size_t MPCOMM_DEFAULT_QPS_PER_CONNECTION = 4;
+
+// Maximum outstanding WQEs per QP (default: 2)
+// Can be configured via environment variable MPCOMM_MAX_OUTSTANDING_PER_QP
+//
+// Bounds in-flight bytes per QP so a protected H2D window can reclaim the PCIe
+// link quickly. Set MPCOMM_MAX_OUTSTANDING_PER_QP=256 for the old behavior.
+static constexpr size_t MPCOMM_DEFAULT_MAX_OUTSTANDING_PER_QP = 2;
 
 // Default GID index used for RoCE path setup (default: 3)
 // Can be overridden via environment variable MPCOMM_GID_INDEX.
@@ -448,6 +465,46 @@ class MPComm {
      * reflects bytes actually delivered to GPU HBM rather than whole transfers.
      */
     uint64_t getNicCompletedBytes() const;
+
+    /**
+     * Per-PCIe-domain in-flight byte accounting (observation only).
+     *
+     * A "PCIe domain" is named by the CUDA device ordinal of the GPU whose HBM
+     * the RDMA payload crosses:
+     *   GATHER  (RDMA_READ)  -> the local  GPU being read into
+     *   SCATTER (RDMA_WRITE) -> the remote GPU being written into
+     * On a 1 GPU : 1 NIC layout each PCIe switch hosts exactly one GPU and one
+     * RDMA NIC, so the ordinal uniquely identifies the contended PCIe uplink.
+     *
+     * in_flight_bytes = posted_bytes - completed_bytes, i.e. bytes the NIC was
+     * authorized to move but has not finished moving. Because a posted WQE
+     * cannot be revoked, this bounds how long a competing H2D (TMA) window must
+     * wait for the link:  T_residual <= in_flight_bytes / BW_pcie.
+     *
+     * Requires MPCOMM_PCIE_STAT_ENABLE=1; otherwise all counters stay zero.
+     * Sample in_flight_bytes_max around a workload to size the admission budget.
+     */
+    struct PcieDomainStats {
+        int gpu_device_id;
+        uint64_t posted_bytes;
+        uint64_t completed_bytes;
+        uint64_t in_flight_bytes;
+        uint64_t in_flight_bytes_max;
+        uint64_t post_count;
+        uint64_t defer_count;
+    };
+
+    /** Snapshot every PCIe domain that has seen traffic since init. */
+    std::vector<PcieDomainStats> getPcieDomainStats() const;
+
+    /** Reset the in-flight watermark and counters (keeps live in-flight state). */
+    void resetPcieDomainStats();
+
+    /** Whether per-PCIe-domain accounting is active. */
+    bool isPcieDomainStatEnabled() const;
+
+    /** Environment variable that enables per-PCIe-domain accounting. */
+    static const char* getPcieStatEnableEnvVarName();
 
     /**
      * Read throttle latency instrumentation (CLOCK_MONOTONIC_RAW, ns).

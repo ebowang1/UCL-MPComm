@@ -90,6 +90,11 @@ namespace mpcomm {
 static constexpr size_t kMaxNics = 16;
 static constexpr size_t kMaxQPsPerNic = 16;
 
+// Upper bound on CUDA device ordinals tracked as PCIe contention domains.
+// Domains are indexed directly by GPU ordinal, so this only needs to cover the
+// largest GPU count per host (8 on current H20/H800 nodes).
+static constexpr size_t kMaxGpuDomains = 16;
+
 // =====================================================================
 // NUMA-aware allocation utilities
 // =====================================================================
@@ -264,6 +269,53 @@ struct H2DActivePolicy {
     std::shared_ptr<QosPacingPolicy> pacing;
 };
 
+// Per-PCIe-domain in-flight byte accounting and admission budget.
+//
+// A domain is named by the CUDA device ordinal of the GPU whose HBM the RDMA
+// traffic lands in (SCATTER / RDMA_WRITE) or is read from (GATHER / RDMA_READ).
+// On a standard 1 GPU : 1 NIC layout every PCIe switch hosts exactly one GPU
+// and one RDMA NIC, so the GPU ordinal uniquely names the contended uplink.
+//
+// in-flight bytes == posted_bytes - completed_bytes, i.e. bytes the NIC has
+// been authorized to move but has not finished moving yet. Because a posted
+// WQE cannot be revoked, this is an UPPER BOUND on future PCIe occupancy and
+// therefore bounds how long a competing H2D window must wait:
+//
+//     T_residual <= inflight_bytes / BW_pcie
+//
+// Limiting in-flight BYTES (rather than a token-bucket rate) is what makes the
+// mechanism usable inside a 30-50 us H2D window: a rate limiter only throttles
+// what has not been posted yet and says nothing about the residual.
+//
+// Throughput follows Little's law, so the budget also sets the achievable rate:
+//
+//     lambda = budget_bytes / RTT
+//
+// Both counters are monotonic, so the subtraction never underflows and needs
+// no lock; the hot path is one relaxed fetch_add plus one acquire load.
+struct PcieDomainState {
+    // ---- accounting (always maintained when instrumentation is on) ----
+    std::atomic<uint64_t> posted_bytes{0};
+    std::atomic<uint64_t> completed_bytes{0};
+    std::atomic<uint64_t> inflight_bytes_max{0};
+    std::atomic<uint64_t> post_count{0};
+    std::atomic<uint64_t> defer_count{0};
+
+    // ---- admission control ----
+    // UINT64_MAX means "unlimited": the domain never gates a post.
+    std::atomic<uint64_t> budget_bytes{UINT64_MAX};
+    // Number of H2D windows currently active on this GPU. A single GPU may
+    // have several concurrent tmaGather calls, so the budget is only restored
+    // when the count drops back to zero.
+    std::atomic<uint32_t> h2d_refcount{0};
+
+    uint64_t inflightBytes() const {
+        const uint64_t posted = posted_bytes.load(std::memory_order_acquire);
+        const uint64_t completed = completed_bytes.load(std::memory_order_acquire);
+        return (posted > completed) ? (posted - completed) : 0;
+    }
+};
+
 // Connection info for a remote host
 struct ConnectionInfo {
     std::string host_id;
@@ -323,6 +375,13 @@ struct TransferContext {
     // For GATHER/RDMA READ this identifies whether the local destination is
     // the GPU protected by an active H2D window.
     int local_gpu_device_id;
+    // For SCATTER/RDMA WRITE the payload lands in the PEER's GPU, so the PCIe
+    // domain is named by the REMOTE ordinal. Resolving it requires a lookup in
+    // the peer's published-buffer table, which is far too expensive to redo for
+    // every 64 KiB chunk, so it is resolved once per host at submit time and
+    // indexed here by the same host_idx that Chunk carries. -1 means "not a GPU
+    // buffer" (plain DRAM) or "unknown", and is simply not accounted.
+    std::vector<int> remote_gpu_device_ids;
     std::vector<std::string> host_list;
     std::vector<uintptr_t> remote_addrs;
     std::vector<size_t> lengths;
@@ -738,6 +797,7 @@ class MPComm::Impl {
     std::vector<std::string> getCandidateNics();
     void discoverTopology();
     void printTopologyInfo();
+    void printPcieAffinitySelfCheck() const;
     int detectGpuDevice(void* addr) const;
     std::vector<size_t> getGpuPcieAffinityNics(int gpu_device_id) const;
     std::vector<size_t> getPcieAffinityNicsForAddr(void* addr) const;
@@ -1028,6 +1088,83 @@ class MPComm::Impl {
     // only counting whole 1GiB transfers. Incremented per successful CQE.
     std::atomic<uint64_t> nic_completed_bytes_{0};
 
+    // ---------------------------------------------------------------------
+    // Per-PCIe-domain in-flight byte accounting (Commit 1: observation only)
+    // ---------------------------------------------------------------------
+    // Indexed directly by CUDA device ordinal. Every RDMA chunk whose payload
+    // crosses a GPU's PCIe uplink is attributed to that GPU's domain:
+    //   GATHER  (RDMA_READ)  -> data lands in the LOCAL  GPU  -> local ordinal
+    //   SCATTER (RDMA_WRITE) -> data lands in the REMOTE GPU  -> remote ordinal
+    // The remote ordinal is already exchanged at connect time, so no new wire
+    // protocol is needed.
+    //
+    // Gated by MPCOMM_PCIE_STAT_ENABLE so the default hot path is unchanged
+    // (one relaxed atomic load that the branch predictor trivially handles).
+    std::array<PcieDomainState, kMaxGpuDomains> pcie_domains_;
+    std::atomic<bool> pcie_stat_enabled_{false};
+
+    bool pcieStatEnabled() const {
+        return pcie_stat_enabled_.load(std::memory_order_relaxed);
+    }
+
+    static bool isValidDomain(int gpu_device_id) {
+        return gpu_device_id >= 0 &&
+               static_cast<size_t>(gpu_device_id) < kMaxGpuDomains;
+    }
+
+    // Account a chunk that was successfully handed to the NIC.
+    void pcieDomainOnPosted(int gpu_device_id, size_t bytes) {
+        if (!isValidDomain(gpu_device_id)) return;
+        auto& dom = pcie_domains_[static_cast<size_t>(gpu_device_id)];
+        const uint64_t posted = dom.posted_bytes.fetch_add(
+            bytes, std::memory_order_acq_rel) + bytes;
+        dom.post_count.fetch_add(1, std::memory_order_relaxed);
+
+        // Track the high-water mark of in-flight bytes. posted is read after
+        // our own increment while completed may race ahead, so the result can
+        // only under-estimate; that is acceptable for a watermark.
+        const uint64_t completed = dom.completed_bytes.load(std::memory_order_acquire);
+        const uint64_t inflight = (posted > completed) ? (posted - completed) : 0;
+        uint64_t observed = dom.inflight_bytes_max.load(std::memory_order_relaxed);
+        while (inflight > observed &&
+               !dom.inflight_bytes_max.compare_exchange_weak(
+                   observed, inflight, std::memory_order_relaxed)) {
+            // observed refreshed by compare_exchange_weak; retry.
+        }
+    }
+
+    // Roll back a reservation when ibv_post_send() itself failed. Without this
+    // the domain would leak in-flight bytes forever and, once admission control
+    // is enabled, permanently stall the domain.
+    void pcieDomainOnPostFailed(int gpu_device_id, size_t bytes) {
+        if (!isValidDomain(gpu_device_id)) return;
+        auto& dom = pcie_domains_[static_cast<size_t>(gpu_device_id)];
+        dom.posted_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+        dom.post_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    // Release accounting once the CQE for a chunk has been reaped.
+    void pcieDomainOnCompleted(int gpu_device_id, size_t bytes) {
+        if (!isValidDomain(gpu_device_id)) return;
+        pcie_domains_[static_cast<size_t>(gpu_device_id)]
+            .completed_bytes.fetch_add(bytes, std::memory_order_acq_rel);
+    }
+
+    // Resolve which PCIe domain a chunk's payload crosses. Hot path: both
+    // branches are plain member reads, no locks and no CUDA calls.
+    //   GATHER  (RDMA_READ)  -> data is written into the LOCAL GPU
+    //   SCATTER (RDMA_WRITE) -> data is written into the REMOTE GPU
+    // Returns -1 when the transfer does not touch GPU memory.
+    static int pcieDomainForChunk(const TransferContext& ctx, size_t host_idx) {
+        if (ctx.direction == TransferDirection::GATHER) {
+            return ctx.local_gpu_device_id;
+        }
+        if (host_idx < ctx.remote_gpu_device_ids.size()) {
+            return ctx.remote_gpu_device_ids[host_idx];
+        }
+        return -1;
+    }
+
     // Effective values honoring the current throttle policy.
     size_t effectiveOutstandingPerQp() const {
         if (throttle_enabled_.load(std::memory_order_relaxed)) {
@@ -1114,6 +1251,9 @@ static const char* kRoceDscpEnvVar = "MPCOMM_ROCE_DSCP";
 static const char* kH2DQosEnableEnvVar = "MPCOMM_H2D_QOS_ENABLE";
 static const char* kH2DQosRateEnvVar = "MPCOMM_H2D_QOS_RATE_BPS";
 static const char* kH2DQosBurstEnvVar = "MPCOMM_H2D_QOS_BURST_BYTES";
+// Observation-only per-PCIe-domain in-flight byte accounting. Set to 1 to
+// enable; disabled by default so the hot path stays untouched.
+static const char* kPcieStatEnableEnvVar = "MPCOMM_PCIE_STAT_ENABLE";
 
 // Constants for QP setup
 static const uint8_t kMaxHopLimit = 16;
@@ -1194,7 +1334,7 @@ MPComm::Impl::Impl()
       poll_batch_size_(64),
       max_idle_spins_(10000),
       max_send_wr_(512),
-      max_outstanding_per_qp_(256),
+      max_outstanding_per_qp_(MPCOMM_DEFAULT_MAX_OUTSTANDING_PER_QP),
       initialized_(false),
       transfer_stats_interval_(0),
       transfer_stats_counter_(0) {
@@ -1306,6 +1446,16 @@ MPComm::Impl::Impl()
             MPCOMM_LOG_WARN("MPComm: Invalid %s value '%s' (must be 1-8192), using default %zu\n",
                     kMaxOutstandingPerQPEnvVar, env_val, max_outstanding_per_qp_);
         }
+    }
+
+    // Read per-PCIe-domain in-flight byte instrumentation switch. Observation
+    // only: it never gates posting, it just maintains the byte counters used to
+    // size the admission budget later.
+    env_val = std::getenv(kPcieStatEnableEnvVar);
+    if (env_val && env_val[0] != '\0' && env_val[0] != '0') {
+        pcie_stat_enabled_.store(true, std::memory_order_release);
+        MPCOMM_LOG_INFO("MPComm: Per-PCIe-domain in-flight accounting enabled via %s\n",
+               kPcieStatEnableEnvVar);
     }
 
     // Read max idle spins from environment variable
@@ -1476,6 +1626,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
     // Discover NUMA topology and print results
     discoverTopology();
     printTopologyInfo();
+    printPcieAffinitySelfCheck();
 
     // Start per-NUMA worker threads for fully async transfer processing
     // Multiple workers per NUMA node, each bound to different CPUs
@@ -2977,6 +3128,78 @@ int MPComm::Impl::getGpuNumaNode(int gpu_device_id) const {
     (void)gpu_device_id;
 #endif
     return -1;
+}
+
+// Print the GPU -> NIC PCIe affinity table discovered from sysfs, alongside the
+// mapping that the name-suffix heuristic would produce.
+//
+// Why this matters: PCIe-domain accounting (and later admission control) keys
+// off getGpuPcieAffinityNics(), i.e. real sysfs topology. Cross-host rail
+// pairing, however, keys off extractNicSuffix() ("mlx5_bond_5" -> 5). On
+// several nodes these two disagree -- e.g. an H20 box where the switch under
+// GPU0 hosts mlx5_bond_1, GPU1 hosts mlx5_bond_4, GPU7 hosts mlx5_bond_5 --
+// so silently assuming "GPU N pairs with NIC N" would attribute traffic to the
+// wrong PCIe domain and throttle the wrong GPU. Printing both makes the
+// discrepancy visible before it is depended upon.
+void MPComm::Impl::printPcieAffinitySelfCheck() const {
+    int gpu_count = 0;
+#ifdef USE_CUDA
+    cudaError_t err = cudaGetDeviceCount(&gpu_count);
+    if (err != cudaSuccess || gpu_count <= 0) {
+        MPCOMM_LOG_INFO("MPComm: PCIe affinity self-check skipped (no CUDA devices)\n");
+        return;
+    }
+#else
+    MPCOMM_LOG_INFO("MPComm: PCIe affinity self-check skipped (built without CUDA)\n");
+    return;
+#endif
+
+    const size_t num_nics = nic_contexts_.size();
+
+    // suffix -> NIC index, used only to show what the heuristic would pick.
+    std::map<int, size_t> suffix_to_nic;
+    for (size_t i = 0; i < num_nics; ++i) {
+        const int suffix = extractNicSuffix(nic_contexts_[i]->device_name);
+        if (suffix >= 0) suffix_to_nic.emplace(suffix, i);
+    }
+
+    MPCOMM_LOG_INFO("MPComm: ===== GPU <-> NIC PCIe affinity self-check =====\n");
+    MPCOMM_LOG_INFO("MPComm:   (domain accounting uses the sysfs column)\n");
+
+    size_t mismatch_count = 0;
+    for (int gpu = 0; gpu < gpu_count && static_cast<size_t>(gpu) < kMaxGpuDomains; ++gpu) {
+        const std::vector<size_t> affine = getGpuPcieAffinityNics(gpu);
+
+        std::string sysfs_desc;
+        for (size_t idx = 0; idx < affine.size(); ++idx) {
+            if (idx > 0) sysfs_desc += ", ";
+            sysfs_desc += (affine[idx] < num_nics)
+                ? nic_contexts_[affine[idx]]->device_name
+                : ("nic#" + std::to_string(affine[idx]));
+        }
+        if (sysfs_desc.empty()) sysfs_desc = "(none)";
+
+        // The heuristic assumes GPU N pairs with the NIC whose suffix is N.
+        auto heur_it = suffix_to_nic.find(gpu);
+        const std::string heuristic_desc = (heur_it != suffix_to_nic.end())
+            ? nic_contexts_[heur_it->second]->device_name
+            : "(none)";
+
+        const bool agrees = !affine.empty() &&
+                            heur_it != suffix_to_nic.end() &&
+                            affine[0] == heur_it->second;
+        if (!agrees) ++mismatch_count;
+
+        MPCOMM_LOG_INFO("MPComm:   GPU%-2d sysfs=[%s]  suffix-heuristic=[%s]  %s\n",
+               gpu, sysfs_desc.c_str(), heuristic_desc.c_str(),
+               agrees ? "match" : "MISMATCH");
+    }
+
+    if (mismatch_count > 0) {
+        MPCOMM_LOG_INFO("MPComm:   %zu GPU(s) disagree with the suffix heuristic; "
+               "PCIe-domain accounting follows sysfs.\n", mismatch_count);
+    }
+    MPCOMM_LOG_INFO("MPComm: ================================================\n");
 }
 
 // Discover PCIe-affine NICs for a GPU device by comparing sysfs PCIe paths.
@@ -4774,6 +4997,19 @@ TransferHandle MPComm::Impl::transferAsyncStart(uintptr_t local_addr,
     ctx->remote_addrs = remote_addrs;
     ctx->lengths = lengths;
     ctx->direction = direction;
+    // Resolve the destination PCIe domain for RDMA WRITE once per host. The
+    // lookup walks the peer's published-buffer table under a mutex, so it must
+    // stay out of the per-chunk post path. Only needed when instrumentation (or
+    // later, admission control) is active.
+    if (direction == TransferDirection::SCATTER && pcieStatEnabled()) {
+        ctx->remote_gpu_device_ids.assign(host_count, -1);
+        for (size_t hi = 0; hi < host_count; ++hi) {
+            ctx->remote_gpu_device_ids[hi] =
+                getRemoteGpuDeviceForAddress(host_list[hi], remote_addrs[hi]);
+        }
+    } else {
+        ctx->remote_gpu_device_ids.clear();
+    }
     ctx->start_time = std::chrono::steady_clock::now();
 
     // Prepare all chunks (same logic as transferImplDynamic)
@@ -6510,6 +6746,17 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 }
                 pacing_skip_count = 0;
 
+                // Resolve the PCIe contention domain this chunk will cross and
+                // reserve its bytes BEFORE handing the WQE to the NIC. Doing it
+                // before the post (rather than after) keeps the in-flight
+                // watermark from ever under-reporting, and is the hook where
+                // admission control will later reject a chunk.
+                const int pcie_domain = pcieStatEnabled()
+                    ? pcieDomainForChunk(ctx, chunk.host_idx) : -1;
+                if (pcie_domain >= 0) {
+                    pcieDomainOnPosted(pcie_domain, chunk.length);
+                }
+
                 // Prepare and post RDMA WR
                 struct ibv_sge sge;
                 memset(&sge, 0, sizeof(sge));
@@ -6531,6 +6778,12 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 struct ibv_send_wr *bad_wr = nullptr;
                 int ret = ibv_post_send(qp, &wr, &bad_wr);
                 if (ret != 0) {
+                    // The NIC never took the WQE, so give the reservation back.
+                    // Skipping this would leak in-flight bytes permanently and
+                    // (once admission control is on) wedge the whole domain.
+                    if (pcie_domain >= 0) {
+                        pcieDomainOnPostFailed(pcie_domain, chunk.length);
+                    }
                     MPCOMM_LOG_ERROR("MPComm: Worker: ibv_post_send failed on NIC %zu: %d\n", best_nic, ret);
                     ctx.error_code.store(MPCOMM_ERR_TRANSFER);
                     ctx.end_time = std::chrono::steady_clock::now();
@@ -6961,6 +7214,32 @@ int MPComm::Impl::pollAllNicsForWorker(
             if (!target_ctx) {
                 // Orphaned completion (transfer already released) — ignore
                 continue;
+            }
+
+            // Release the PCIe-domain reservation for this chunk. This happens
+            // BEFORE the WC-status check on purpose: a CQE means the NIC is done
+            // with the WQE either way, so the PCIe occupancy is over. Releasing
+            // only on success would leak bytes on every WC error and eventually
+            // wedge the domain once admission control is enabled.
+            //
+            // The exact chunk length is used rather than max_chunk_size (as the
+            // legacy nic_completed_bytes_ counter does) because posted and
+            // completed must agree exactly; a per-chunk rounding error would
+            // accumulate and leave in-flight permanently non-zero.
+            if (pcieStatEnabled()) {
+                const size_t completed_chunk_idx =
+                    WrIdEncoding::decodeChunk(wc_array[i].wr_id);
+                if (completed_chunk_idx < target_ctx->total_chunks.load(
+                        std::memory_order_acquire)) {
+                    const auto completed_chunk =
+                        target_ctx->getChunk(completed_chunk_idx);
+                    const int completed_domain =
+                        pcieDomainForChunk(*target_ctx, completed_chunk.host_idx);
+                    if (completed_domain >= 0) {
+                        pcieDomainOnCompleted(completed_domain,
+                                              completed_chunk.length);
+                    }
+                }
             }
 
             if (wc_array[i].status != IBV_WC_SUCCESS) {
@@ -7394,6 +7673,51 @@ void MPComm::disableH2DQoS() {
 
 uint64_t MPComm::getNicCompletedBytes() const {
     return impl_->getNicCompletedBytes();
+}
+
+std::vector<MPComm::PcieDomainStats> MPComm::getPcieDomainStats() const {
+    std::vector<PcieDomainStats> out;
+    for (size_t gpu = 0; gpu < kMaxGpuDomains; ++gpu) {
+        const auto& dom = impl_->pcie_domains_[gpu];
+        const uint64_t posted = dom.posted_bytes.load(std::memory_order_acquire);
+        const uint64_t completed = dom.completed_bytes.load(std::memory_order_acquire);
+        const uint64_t posts = dom.post_count.load(std::memory_order_relaxed);
+        // Skip domains that never carried traffic so callers only see real ones.
+        if (posted == 0 && completed == 0 && posts == 0) continue;
+
+        PcieDomainStats entry;
+        entry.gpu_device_id = static_cast<int>(gpu);
+        entry.posted_bytes = posted;
+        entry.completed_bytes = completed;
+        entry.in_flight_bytes = (posted > completed) ? (posted - completed) : 0;
+        entry.in_flight_bytes_max =
+            dom.inflight_bytes_max.load(std::memory_order_relaxed);
+        entry.post_count = posts;
+        entry.defer_count = dom.defer_count.load(std::memory_order_relaxed);
+        out.push_back(entry);
+    }
+    return out;
+}
+
+void MPComm::resetPcieDomainStats() {
+    for (size_t gpu = 0; gpu < kMaxGpuDomains; ++gpu) {
+        auto& dom = impl_->pcie_domains_[gpu];
+        // posted/completed are deliberately NOT zeroed: they track live
+        // in-flight state, and clearing them independently would corrupt the
+        // posted-completed difference for chunks still on the wire. Re-seed the
+        // watermark from the current in-flight level instead.
+        dom.inflight_bytes_max.store(dom.inflightBytes(), std::memory_order_relaxed);
+        dom.post_count.store(0, std::memory_order_relaxed);
+        dom.defer_count.store(0, std::memory_order_relaxed);
+    }
+}
+
+bool MPComm::isPcieDomainStatEnabled() const {
+    return impl_->pcieStatEnabled();
+}
+
+const char* MPComm::getPcieStatEnableEnvVarName() {
+    return kPcieStatEnableEnvVar;
 }
 
 size_t MPComm::getQpsPerConnection() const {

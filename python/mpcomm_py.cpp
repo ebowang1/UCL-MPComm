@@ -370,6 +370,41 @@ class MPCommPy {
     }
 
     /**
+     * Per-PCIe-domain in-flight byte accounting (observation only).
+     *
+     * Returns one dict per GPU domain that carried traffic:
+     *   gpu, posted_bytes, completed_bytes, in_flight_bytes,
+     *   in_flight_bytes_max, post_count, defer_count
+     *
+     * in_flight_bytes bounds the residual PCIe occupancy a competing H2D window
+     * must wait out, since a posted WQE cannot be revoked. Requires
+     * MPCOMM_PCIE_STAT_ENABLE=1.
+     */
+    py::list getPcieDomainStats() const {
+        py::list out;
+        for (const auto& stat : comm_.getPcieDomainStats()) {
+            py::dict entry;
+            entry["gpu"] = stat.gpu_device_id;
+            entry["posted_bytes"] = stat.posted_bytes;
+            entry["completed_bytes"] = stat.completed_bytes;
+            entry["in_flight_bytes"] = stat.in_flight_bytes;
+            entry["in_flight_bytes_max"] = stat.in_flight_bytes_max;
+            entry["post_count"] = stat.post_count;
+            entry["defer_count"] = stat.defer_count;
+            out.append(std::move(entry));
+        }
+        return out;
+    }
+
+    /** Reset per-domain watermark/counters; live in-flight state is preserved. */
+    void resetPcieDomainStats() { comm_.resetPcieDomainStats(); }
+
+    /** Whether per-PCIe-domain accounting is active. */
+    bool isPcieDomainStatEnabled() const {
+        return comm_.isPcieDomainStatEnabled();
+    }
+
+    /**
      * Read throttle latency instrumentation.
      * @return dict with timestamps, the t3 outstanding-WQE snapshot, and
      *         derived worker/drain/effective durations in microseconds.
@@ -778,6 +813,16 @@ m.doc() = "MPComm - Memory Pooling Communication using native ibverbs";
         .def("get_nic_completed_bytes", &MPCommPy::getNicCompletedBytes,
              "Cumulative NIC->GPU bytes whose RDMA CQE has completed since "
              "init (for windowed background-NIC bandwidth measurement)")
+        .def("get_pcie_domain_stats", &MPCommPy::getPcieDomainStats,
+             "Per-PCIe-domain in-flight byte accounting; list of dicts with "
+             "gpu/posted_bytes/completed_bytes/in_flight_bytes/"
+             "in_flight_bytes_max/post_count/defer_count "
+             "(requires MPCOMM_PCIE_STAT_ENABLE=1)")
+        .def("reset_pcie_domain_stats", &MPCommPy::resetPcieDomainStats,
+             "Reset per-PCIe-domain watermark and counters; in-flight state is "
+             "preserved")
+        .def("is_pcie_domain_stat_enabled", &MPCommPy::isPcieDomainStatEnabled,
+             "Return whether per-PCIe-domain in-flight accounting is active")
         .def("get_throttle_latency", &MPCommPy::getThrottleLatency,
              "Read throttle latency instrumentation (ns timestamps + derived us)")
         .def("write_bytes_to_buffer", &MPCommPy::writeBytesToBuffer,

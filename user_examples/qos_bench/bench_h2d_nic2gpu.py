@@ -56,6 +56,34 @@ def format_size(value):
 	return f"{size:.2f}GiB"
 
 
+def print_pcie_domain_stats(comm):
+	"""Print per-PCIe-domain in-flight byte accounting, if instrumented.
+
+	in_flight = posted - completed, i.e. bytes the NIC was authorized to move
+	but has not finished moving. A posted WQE cannot be revoked, so this bounds
+	how long a competing H2D window must wait for the PCIe uplink:
+	    T_residual <= in_flight / BW_pcie
+	inflight_max is the value that sizes a future admission budget.
+
+	No-op unless MPCOMM_PCIE_STAT_ENABLE=1.
+	"""
+	getter = getattr(comm, "get_pcie_domain_stats", None)
+	if getter is None:
+		return
+	try:
+		stats = getter()
+	except Exception:
+		return
+	for entry in stats:
+		print(f"[PCIE-DOMAIN] gpu={entry['gpu']} "
+			  f"inflight={format_size(entry['in_flight_bytes'])} "
+			  f"inflight_max={format_size(entry['in_flight_bytes_max'])} "
+			  f"posted={format_size(entry['posted_bytes'])} "
+			  f"completed={format_size(entry['completed_bytes'])} "
+			  f"posts={entry['post_count']} "
+			  f"defers={entry['defer_count']}", flush=True)
+
+
 def allocate_aligned(size_bytes):
 	libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 	pointer = ctypes.c_void_p()
@@ -318,6 +346,7 @@ def run_nic2gpu(comm, args):
 							  f"window={len(window_latencies)} avg_ms={window['average_ms']:.4f} "
 							  f"avg_GB/s={window['average_bandwidth_gbs']:.2f} "
 							  f"p99_ms={window['p99_ms']:.4f}", flush=True)
+						print_pcie_domain_stats(comm)
 						window_latencies.clear()
 				if args.report_every > 0 and window_latencies:
 					window = summarize(window_latencies, size)
@@ -326,6 +355,7 @@ def run_nic2gpu(comm, args):
 						  f"window={len(window_latencies)} avg_ms={window['average_ms']:.4f} "
 						  f"avg_GB/s={window['average_bandwidth_gbs']:.2f} "
 						  f"p99_ms={window['p99_ms']:.4f}", flush=True)
+					print_pcie_domain_stats(comm)
 				row = {"path": "nic2gpu", "operation": operation, "backend": "GPUDirect-RDMA", "block_size": size, "num_blocks": 1, "bytes_per_iteration": size, "iterations": args.iterations, "workload": format_size(size)}
 				row.update(summarize(latencies, size))
 				rows.append(row)

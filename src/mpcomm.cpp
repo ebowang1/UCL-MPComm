@@ -1165,6 +1165,54 @@ class MPComm::Impl {
         return -1;
     }
 
+public:
+    // ---- Public accessors for the PCIe-domain counters ------------------
+    // The counters themselves stay private; the public wrapper class reaches
+    // them only through these three entry points.
+
+    bool isPcieStatEnabled() const { return pcieStatEnabled(); }
+
+    // Snapshot every domain that has carried traffic since init.
+    std::vector<MPComm::PcieDomainStats> snapshotPcieDomainStats() const {
+        std::vector<MPComm::PcieDomainStats> out;
+        for (size_t gpu = 0; gpu < kMaxGpuDomains; ++gpu) {
+            const auto& dom = pcie_domains_[gpu];
+            const uint64_t posted = dom.posted_bytes.load(std::memory_order_acquire);
+            const uint64_t completed = dom.completed_bytes.load(std::memory_order_acquire);
+            const uint64_t posts = dom.post_count.load(std::memory_order_relaxed);
+            // Skip untouched domains so callers only see real ones.
+            if (posted == 0 && completed == 0 && posts == 0) continue;
+
+            MPComm::PcieDomainStats entry;
+            entry.gpu_device_id = static_cast<int>(gpu);
+            entry.posted_bytes = posted;
+            entry.completed_bytes = completed;
+            entry.in_flight_bytes = (posted > completed) ? (posted - completed) : 0;
+            entry.in_flight_bytes_max =
+                dom.inflight_bytes_max.load(std::memory_order_relaxed);
+            entry.post_count = posts;
+            entry.defer_count = dom.defer_count.load(std::memory_order_relaxed);
+            out.push_back(entry);
+        }
+        return out;
+    }
+
+    // Reset the watermark and rate counters. posted/completed are deliberately
+    // preserved: they track live in-flight state, and zeroing them
+    // independently would corrupt the posted-completed difference for chunks
+    // still on the wire.
+    void resetPcieDomainCounters() {
+        for (size_t gpu = 0; gpu < kMaxGpuDomains; ++gpu) {
+            auto& dom = pcie_domains_[gpu];
+            dom.inflight_bytes_max.store(dom.inflightBytes(),
+                                         std::memory_order_relaxed);
+            dom.post_count.store(0, std::memory_order_relaxed);
+            dom.defer_count.store(0, std::memory_order_relaxed);
+        }
+    }
+
+private:
+
     // Effective values honoring the current throttle policy.
     size_t effectiveOutstandingPerQp() const {
         if (throttle_enabled_.load(std::memory_order_relaxed)) {
@@ -7676,44 +7724,15 @@ uint64_t MPComm::getNicCompletedBytes() const {
 }
 
 std::vector<MPComm::PcieDomainStats> MPComm::getPcieDomainStats() const {
-    std::vector<PcieDomainStats> out;
-    for (size_t gpu = 0; gpu < kMaxGpuDomains; ++gpu) {
-        const auto& dom = impl_->pcie_domains_[gpu];
-        const uint64_t posted = dom.posted_bytes.load(std::memory_order_acquire);
-        const uint64_t completed = dom.completed_bytes.load(std::memory_order_acquire);
-        const uint64_t posts = dom.post_count.load(std::memory_order_relaxed);
-        // Skip domains that never carried traffic so callers only see real ones.
-        if (posted == 0 && completed == 0 && posts == 0) continue;
-
-        PcieDomainStats entry;
-        entry.gpu_device_id = static_cast<int>(gpu);
-        entry.posted_bytes = posted;
-        entry.completed_bytes = completed;
-        entry.in_flight_bytes = (posted > completed) ? (posted - completed) : 0;
-        entry.in_flight_bytes_max =
-            dom.inflight_bytes_max.load(std::memory_order_relaxed);
-        entry.post_count = posts;
-        entry.defer_count = dom.defer_count.load(std::memory_order_relaxed);
-        out.push_back(entry);
-    }
-    return out;
+    return impl_->snapshotPcieDomainStats();
 }
 
 void MPComm::resetPcieDomainStats() {
-    for (size_t gpu = 0; gpu < kMaxGpuDomains; ++gpu) {
-        auto& dom = impl_->pcie_domains_[gpu];
-        // posted/completed are deliberately NOT zeroed: they track live
-        // in-flight state, and clearing them independently would corrupt the
-        // posted-completed difference for chunks still on the wire. Re-seed the
-        // watermark from the current in-flight level instead.
-        dom.inflight_bytes_max.store(dom.inflightBytes(), std::memory_order_relaxed);
-        dom.post_count.store(0, std::memory_order_relaxed);
-        dom.defer_count.store(0, std::memory_order_relaxed);
-    }
+    impl_->resetPcieDomainCounters();
 }
 
 bool MPComm::isPcieDomainStatEnabled() const {
-    return impl_->pcieStatEnabled();
+    return impl_->isPcieStatEnabled();
 }
 
 const char* MPComm::getPcieStatEnableEnvVarName() {

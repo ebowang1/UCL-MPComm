@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # NIC->GPU 基准 —— 发起端(INITIATOR). 在【有 GPU 的本机】上运行.
-# GPU HBM 作 local buffer, 经本地网卡与远端 target 做 GPUDirect RDMA.
+# 默认 GPU HBM 作 local buffer, 经本地网卡与远端 target 做 GPUDirect RDMA.
 #   get = 远端 NIC -> 本地 GPU (读带宽/时延)
 #   put = 本地 GPU -> 远端      (写带宽/时延)
+#
+# MPCOMM_BENCH_DEST=cpu 时, local buffer 改为 pinned host DRAM:
+#   get = 远端 GPU -> 本地 CPU (本地发起的 RDMA READ 落到 host)
 #
 # 用法:
 #   ./run-bench-nic2gpu-initiator.sh <TARGET> [GPU_ID] [OP] [SIZES] [DEVICE]
@@ -37,13 +40,16 @@ if [[ -z "${TARGET}" ]]; then
     exit 1
 fi
 
-# 检查 nvidia-peermem (GPUDirect RDMA 依赖)
-if ! lsmod 2>/dev/null | grep -q nvidia_peermem; then
+DEST="${MPCOMM_BENCH_DEST:-gpu}"
+
+# 检查 nvidia-peermem (GPUDirect RDMA 依赖). --dest cpu 时本地 buffer 是 host DRAM,
+# 不依赖 nvidia-peermem; 但若 target 侧用 GPU HBM, 仍需在 target 上加载.
+if [[ "${DEST}" == "gpu" ]] && ! lsmod 2>/dev/null | grep -q nvidia_peermem; then
     echo "[warn] 未检测到 nvidia_peermem 内核模块, GPU 内存注册可能失败!" >&2
     echo "[warn] 请先: sudo modprobe nvidia-peermem" >&2
 fi
 
-echo "[run-bench-nic2gpu-initiator] target=${TARGET} GPU=${GPU_ID} op=${OP} sizes=${SIZES} csv=${CSV}"
+echo "[run-bench-nic2gpu-initiator] target=${TARGET} GPU=${GPU_ID} op=${OP} sizes=${SIZES} dest=${DEST} csv=${CSV}"
 
 python3 "${SCRIPT_DIR}/bench_h2d_nic2gpu.py" \
     --path nic2gpu \
@@ -52,6 +58,7 @@ python3 "${SCRIPT_DIR}/bench_h2d_nic2gpu.py" \
     --sizes "${SIZES}" \
     --target "${TARGET}" \
     --device "${DEVICE}" \
+    --dest "${DEST}" \
     --host-id "${MPCOMM_HOST_ID:-initiator:0}" \
     --iters "${MPCOMM_BENCH_ITERS:-50}" \
     --warmup "${MPCOMM_BENCH_WARMUP:-10}" \

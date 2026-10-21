@@ -310,10 +310,18 @@ def run_nic2gpu(comm, args):
 	if not remote or comm.update_remote_memory_info(host_id, remote["rkeys"]) != 0:
 		raise RuntimeError("remote buffer or rkey setup failed")
 	sizes = [parse_size(value) for value in args.sizes.split(",") if value.strip()]
-	gpu_buffer = torch.empty(max(sizes), device=f"cuda:{args.gpu}", dtype=torch.uint8)
-	local_address = gpu_buffer.data_ptr()
-	if comm.register_memory(local_address, gpu_buffer.numel()) != 0:
-		raise RuntimeError("GPU memory registration failed; check nvidia-peermem")
+	# Receive buffer. "gpu" (default) is GPUDirect RDMA into local HBM; "cpu"
+	# registers pinned host DRAM instead, so a READ initiated here lands in local
+	# CPU memory (remote GPU -> local CPU). The source is still whatever the target
+	# publishes, so pair --dest cpu with a --gpu target for "remote GPU -> local CPU".
+	if args.dest == "cpu":
+		local_buffer = torch.empty(max(sizes), dtype=torch.uint8, pin_memory=True)
+	else:
+		local_buffer = torch.empty(max(sizes), device=f"cuda:{args.gpu}", dtype=torch.uint8)
+	local_address = local_buffer.data_ptr()
+	if comm.register_memory(local_address, local_buffer.numel()) != 0:
+		hint = "; check nvidia-peermem" if args.dest == "gpu" else ""
+		raise RuntimeError(f"{args.dest} memory registration failed{hint}")
 	rows = []
 	try:
 		operations = ["get", "put"] if args.op == "both" else [args.op]
@@ -356,12 +364,15 @@ def run_nic2gpu(comm, args):
 						  f"avg_GB/s={window['average_bandwidth_gbs']:.2f} "
 						  f"p99_ms={window['p99_ms']:.4f}", flush=True)
 					print_pcie_domain_stats(comm)
-				row = {"path": "nic2gpu", "operation": operation, "backend": "GPUDirect-RDMA", "block_size": size, "num_blocks": 1, "bytes_per_iteration": size, "iterations": args.iterations, "workload": format_size(size)}
+				backend = "GPUDirect-RDMA" if args.dest == "gpu" else "RDMA-to-host(pinned)"
+				row = {"path": "nic2gpu", "operation": operation, "backend": backend, "block_size": size, "num_blocks": 1, "bytes_per_iteration": size, "iterations": args.iterations, "workload": format_size(size)}
 				row.update(summarize(latencies, size))
 				rows.append(row)
 	finally:
 		comm.unregister_memory(local_address)
-	print_results("NIC-to-GPU GPUDirect RDMA", rows)
+	title = ("NIC-to-GPU GPUDirect RDMA" if args.dest == "gpu"
+			 else "NIC-to-CPU RDMA (remote GPU -> local host)")
+	print_results(title, rows)
 	return rows
 
 
@@ -398,6 +409,13 @@ def main():
 	parser.add_argument("--target", default="")
 	parser.add_argument("--host-id", default=os.getenv("MPCOMM_HOST_ID", "initiator:0"))
 	parser.add_argument("--device", default=os.getenv("MPCOMM_DEVICE", ""))
+	parser.add_argument(
+		"--dest",
+		choices=("gpu", "cpu"),
+		default="gpu",
+		help="local receive buffer for --path nic2gpu: gpu (default, GPUDirect "
+			 "into HBM) or cpu (pinned host DRAM, i.e. remote -> local CPU)",
+	)
 	args = parser.parse_args()
 	if args.iterations <= 0 or args.warmup < 0 or args.report_every < 0:
 		raise ValueError("iterations must be positive; warmup and report-every cannot be negative")

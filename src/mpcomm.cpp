@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #ifdef USE_CUDA
@@ -545,6 +546,8 @@ class MPComm::Impl {
     // Public API implementation
     int init(const std::string &local_host_id,
              const std::string &device_names, int tcp_port);
+    int initSingleNicPair(const std::string &local_host_id,
+                          const std::string &device_name, int tcp_port);
     void shutdown();
     int registerMemory(void *addr, size_t length);
     int unregisterMemory(void *addr);
@@ -804,6 +807,7 @@ class MPComm::Impl {
     size_t max_outstanding_per_qp_;
 
     bool initialized_;
+    bool single_nic_pair_;
     size_t transfer_stats_interval_;              // Print stats every N transfers (0 = every transfer)
     std::atomic<size_t> transfer_stats_counter_;  // Global transfer completion counter
 
@@ -880,6 +884,14 @@ static std::atomic<int> qp_port_index{0};
 // Use high values (magic numbers) to avoid conflict with NIC counts
 // NIC count is typically 1-16, so values > 0x10000000 are safe
 static const uint32_t kMsgTypeBufferQuery = 0x4D504251;  // "MPBQ" in hex
+static const uint32_t kMsgTypeSingleNicConnect = 0x4D50534E;
+
+static bool setSingleNicControlTimeouts(int fd) {
+    struct timeval timeout = {};
+    timeout.tv_sec = 10;
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+           setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0;
+}
 
 // ============================================================================
 // Utility Functions
@@ -941,6 +953,7 @@ MPComm::Impl::Impl()
       max_send_wr_(512),
       max_outstanding_per_qp_(256),
       initialized_(false),
+      single_nic_pair_(false),
       transfer_stats_interval_(0),
       transfer_stats_counter_(0) {
     // Read max RDMA transfer size from environment variable
@@ -1090,6 +1103,39 @@ init()
 */
 
 
+int MPComm::Impl::initSingleNicPair(const std::string &local_host_id,
+                                   const std::string &device_name,
+                                   int tcp_port) {
+    if (initialized_) {
+        MPCOMM_LOG_ERROR("MPComm: Already initialized\n");
+        return MPCOMM_ERR_CONTEXT;
+    }
+    if (device_name.empty() || device_name.find(',') != std::string::npos ||
+        device_name.find('\0') != std::string::npos || tcp_port < 0 || tcp_port > 65535) {
+        MPCOMM_LOG_ERROR("MPComm: Single-NIC pair requires one explicit device and a valid TCP port\n");
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+    const char* env_filter = std::getenv(kNicFilterEnvVar);
+    if (env_filter && env_filter[0] != '\0' && device_name != env_filter) {
+        MPCOMM_LOG_ERROR("MPComm: %s='%s' conflicts with single-NIC device '%s'\n",
+                         kNicFilterEnvVar, env_filter, device_name.c_str());
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+    single_nic_pair_ = true;
+    int ret = init(local_host_id, device_name, tcp_port);
+    if (ret != MPCOMM_SUCCESS) {
+        shutdown();
+        return ret;
+    }
+    if (getNumNics() != 1 || getDeviceName(0) != device_name) {
+        MPCOMM_LOG_ERROR("MPComm: Single-NIC initialization did not select exactly '%s'\n",
+                         device_name.c_str());
+        shutdown();
+        return MPCOMM_ERR_DEVICE;
+    }
+    return MPCOMM_SUCCESS;
+}
+
 int MPComm::Impl::init(const std::string &local_host_id,
                  const std::string &device_names,
                  int tcp_port) {
@@ -1130,7 +1176,7 @@ int MPComm::Impl::init(const std::string &local_host_id,
     }
 
     // Setup TCP listener if port specified
-    if (tcp_port > 0) {
+    if (tcp_port > 0 || single_nic_pair_) {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             MPCOMM_PLOG_ERROR("MPComm: Failed to create socket");
@@ -1407,6 +1453,7 @@ void MPComm::Impl::shutdown() {
 
     connections_.clear();
     initialized_ = false;
+    single_nic_pair_ = false;
 }
 /*
 openDevices():
@@ -1439,7 +1486,7 @@ int MPComm::Impl::openDevices(const std::string &device_names) {
 
     // Check environment variable for additional/override filter
     const char* env_filter = std::getenv(kNicFilterEnvVar);
-    if (env_filter != nullptr && strlen(env_filter) > 0) {
+    if (!single_nic_pair_ && env_filter != nullptr && strlen(env_filter) > 0) {
         // If env var is set, it takes precedence (overrides device_names if provided)
         // Clear existing filter and use env var
         filter.clear();
@@ -2472,6 +2519,12 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
         memcpy(&addr.sin_addr, he->h_addr, he->h_length);
     }
 
+    if (single_nic_pair_ && !setSingleNicControlTimeouts(sock_fd)) {
+        MPCOMM_PLOG_ERROR("MPComm: Failed to set single-NIC buffer query timeouts");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
+
     if (::connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         MPCOMM_PLOG_ERROR("MPComm: Failed to connect for buffer query");
         close(sock_fd);
@@ -2483,7 +2536,8 @@ int MPComm::Impl::queryRemoteBuffer(const std::string &remote_host_id,
 
     // Send message type: buffer query
     uint32_t msg_type = kMsgTypeBufferQuery;
-    if (send(sock_fd, &msg_type, sizeof(msg_type), 0) != sizeof(msg_type)) {
+    if (send(sock_fd, &msg_type, sizeof(msg_type), single_nic_pair_ ? MSG_NOSIGNAL : 0) !=
+            sizeof(msg_type)) {
         MPCOMM_PLOG_ERROR("MPComm: Failed to send message type");
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
@@ -2691,6 +2745,9 @@ const PublishedBufferInfo* MPComm::Impl::getPublishedBufferInfo() const {
 }
 
 void MPComm::Impl::handleBufferQuery(int client_fd) {
+    const auto send = [this](int fd, const void* data, size_t size, int flags) {
+        return ::send(fd, data, size, flags | (single_nic_pair_ ? MSG_NOSIGNAL : 0));
+    };
     std::lock_guard<std::mutex> lock(published_buffer_mutex_);
 
     // Check if any buffers are published
@@ -2902,6 +2959,9 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                     const std::string &remote_tcp_addr,
                     int remote_tcp_port) {
     if (!initialized_) return MPCOMM_ERR_CONTEXT;
+    const auto send = [this](int fd, const void* data, size_t size, int flags) {
+        return ::send(fd, data, size, flags | (single_nic_pair_ ? MSG_NOSIGNAL : 0));
+    };
 
     MPCOMM_LOG_INFO("MPComm: Connecting to %s at %s:%d\n",
            remote_host_id.c_str(), remote_tcp_addr.c_str(), remote_tcp_port);
@@ -2930,6 +2990,12 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         memcpy(&addr.sin_addr, he->h_addr, he->h_length);
     }
 
+    if (single_nic_pair_ && !setSingleNicControlTimeouts(sock_fd)) {
+        MPCOMM_PLOG_ERROR("MPComm: Failed to set single-NIC control timeouts");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
+
     if (::connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         MPCOMM_PLOG_ERROR("MPComm: Failed to connect");
         close(sock_fd);
@@ -2947,6 +3013,15 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
 
     // Send number of local NICs
     uint32_t num_nics = static_cast<uint32_t>(nic_contexts_.size());
+    if (single_nic_pair_) {
+        if (num_nics != 1 ||
+            send(sock_fd, &kMsgTypeSingleNicConnect, sizeof(kMsgTypeSingleNicConnect), 0) !=
+                sizeof(kMsgTypeSingleNicConnect)) {
+            MPCOMM_LOG_ERROR("MPComm: Failed to start single-NIC handshake\n");
+            close(sock_fd);
+            return MPCOMM_ERR_CONNECTION;
+        }
+    }
     if (send(sock_fd, &num_nics, sizeof(num_nics), 0) != sizeof(num_nics)) {
         MPCOMM_PLOG_ERROR("MPComm: Failed to send num_nics");
         close(sock_fd);
@@ -2958,6 +3033,12 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
     if (recv(sock_fd, &remote_num_nics, sizeof(remote_num_nics), MSG_WAITALL) !=
         sizeof(remote_num_nics)) {
         MPCOMM_PLOG_ERROR("MPComm: Failed to receive remote_num_nics");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
+    if (single_nic_pair_ && remote_num_nics != 1) {
+        MPCOMM_LOG_ERROR("MPComm: Single-NIC peer advertised %u NICs, expected 1\n",
+                         remote_num_nics);
         close(sock_fd);
         return MPCOMM_ERR_CONNECTION;
     }
@@ -3113,6 +3194,11 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
 
     size_t actual_qps = std::min(static_cast<size_t>(qps_per_conn),
                                   static_cast<size_t>(remote_qps_per_conn));
+    if (single_nic_pair_ && actual_qps == 0) {
+        MPCOMM_LOG_ERROR("MPComm: Single-NIC peer advertised zero QPs\n");
+        close(sock_fd);
+        return MPCOMM_ERR_CONNECTION;
+    }
     MPCOMM_LOG_INFO("MPComm: Using %zu QPs per NIC connection\n", actual_qps);
 
     // Name-based NUMA-aware connection strategy:
@@ -3143,18 +3229,21 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
         // Calculate which remote NICs this local NIC should connect to
         std::vector<size_t> target_remote_nics;
 
-        // Primary: find remote NIC with same suffix N
-        auto it = remote_suffix_to_nics.find(local_suffix);
-        if (it != remote_suffix_to_nics.end() && !it->second.empty()) {
-            target_remote_nics.push_back(it->second[0]);
-        }
-
-        // Secondary: find remote NIC with cross-NUMA suffix
-        // If local suffix >= 4, try N-4 (e.g., 5 -> 1); otherwise try N+4 (e.g., 1 -> 5)
         int cross_numa_suffix = (local_suffix >= 4) ? (local_suffix - 4) : (local_suffix + 4);
-        auto it2 = remote_suffix_to_nics.find(cross_numa_suffix);
-        if (it2 != remote_suffix_to_nics.end() && !it2->second.empty()) {
-            target_remote_nics.push_back(it2->second[0]);
+        if (single_nic_pair_) {
+            target_remote_nics.push_back(0);
+        } else {
+            // Primary: find remote NIC with same suffix N
+            auto it = remote_suffix_to_nics.find(local_suffix);
+            if (it != remote_suffix_to_nics.end() && !it->second.empty()) {
+                target_remote_nics.push_back(it->second[0]);
+            }
+
+            // Secondary: find remote NIC with cross-NUMA suffix
+            auto it2 = remote_suffix_to_nics.find(cross_numa_suffix);
+            if (it2 != remote_suffix_to_nics.end() && !it2->second.empty()) {
+                target_remote_nics.push_back(it2->second[0]);
+            }
         }
 
         if (target_remote_nics.empty()) {
@@ -3303,6 +3392,20 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
                     }
                 }
 
+                if (single_nic_pair_) {
+                    uint8_t passive_status = 1;
+                    if (recv(sock_fd, &passive_status, sizeof(passive_status), MSG_WAITALL) !=
+                            sizeof(passive_status) || passive_status != 0) {
+                        MPCOMM_LOG_ERROR("MPComm: Single-NIC passive QP[%zu] setup failed\n", qp_idx);
+                        destroyQP(qp);
+                        for (auto *created_qp : qp_list) {
+                            destroyQP(created_qp);
+                        }
+                        close(sock_fd);
+                        return MPCOMM_ERR_CONNECTION;
+                    }
+                }
+
                 qp_list.push_back(qp);
 
                 // Store remote endpoint info for this remote NIC
@@ -3312,6 +3415,11 @@ int MPComm::Impl::connect(const std::string &remote_host_id,
             }
 
             if (connection_failed) {
+                if (single_nic_pair_) {
+                    MPCOMM_LOG_ERROR("MPComm: Single-NIC QP setup failed; connection rejected\n");
+                    close(sock_fd);
+                    return MPCOMM_ERR_CONNECTION;
+                }
                 // Remove this remote NIC from the mapping since connection failed
                 auto map_it = conn_info.local_to_remote_nic_map.find(local_nic);
                 if (map_it != conn_info.local_to_remote_nic_map.end()) {
@@ -3395,6 +3503,9 @@ void MPComm::Impl::stopAcceptThread() {
 }
 
 void MPComm::Impl::acceptLoop() {
+    const auto send = [this](int fd, const void* data, size_t size, int flags) {
+        return ::send(fd, data, size, flags | (single_nic_pair_ ? MSG_NOSIGNAL : 0));
+    };
     while (accept_running_) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
@@ -3420,6 +3531,11 @@ void MPComm::Impl::acceptLoop() {
         // Disable Nagle's algorithm
         int flag = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        if (single_nic_pair_ && !setSingleNicControlTimeouts(client_fd)) {
+            MPCOMM_PLOG_ERROR("MPComm: Failed to set single-NIC control timeouts");
+            close(client_fd);
+            continue;
+        }
 
         // Receive message type (first 4 bytes)
         uint32_t msg_type;
@@ -3437,11 +3553,26 @@ void MPComm::Impl::acceptLoop() {
             continue;
         }
 
-        // Treat as connection request (backward compatible: msg_type is num_nics)
+        const bool single_request = msg_type == kMsgTypeSingleNicConnect;
+        if (single_request != single_nic_pair_) {
+            MPCOMM_LOG_ERROR("MPComm: Single-NIC and legacy connection modes do not match\n");
+            close(client_fd);
+            continue;
+        }
+
+        // Legacy requests encode num_nics directly in the first word.
         uint32_t remote_num_nics = msg_type;
+        uint32_t num_nics = static_cast<uint32_t>(nic_contexts_.size());
+        if (single_request) {
+            if (recv(client_fd, &remote_num_nics, sizeof(remote_num_nics), MSG_WAITALL) !=
+                    sizeof(remote_num_nics) || remote_num_nics != 1 || num_nics != 1) {
+                MPCOMM_LOG_ERROR("MPComm: Single-NIC handshake requires exactly one NIC on both peers\n");
+                close(client_fd);
+                continue;
+            }
+        }
 
         // Send number of local NICs
-        uint32_t num_nics = static_cast<uint32_t>(nic_contexts_.size());
         if (send(client_fd, &num_nics, sizeof(num_nics), 0) !=
             sizeof(num_nics)) {
             MPCOMM_PLOG_ERROR("MPComm: Failed to send num_nics");
@@ -3510,11 +3641,16 @@ void MPComm::Impl::acceptLoop() {
         }
 
         // Receive remote NIC names (passive side receives first, then sends)
+        bool nic_names_ok = true;
         std::vector<std::string> remote_nic_names(remote_num_nics);
         for (size_t i = 0; i < remote_num_nics; ++i) {
             uint32_t name_len;
             if (recv(client_fd, &name_len, sizeof(name_len), MSG_WAITALL) != sizeof(name_len)) {
                 MPCOMM_PLOG_ERROR("MPComm: Failed to receive nic_name length");
+                if (single_request) {
+                    nic_names_ok = false;
+                    break;
+                }
                 close(client_fd);
                 continue;
             }
@@ -3522,11 +3658,19 @@ void MPComm::Impl::acceptLoop() {
                 std::vector<char> buf(name_len + 1, 0);
                 if (recv(client_fd, buf.data(), name_len, MSG_WAITALL) != static_cast<ssize_t>(name_len)) {
                     MPCOMM_PLOG_ERROR("MPComm: Failed to receive nic_name");
+                    if (single_request) {
+                        nic_names_ok = false;
+                        break;
+                    }
                     close(client_fd);
                     continue;
                 }
                 remote_nic_names[i] = std::string(buf.data());
             }
+        }
+        if (!nic_names_ok) {
+            close(client_fd);
+            continue;
         }
         conn_info.remote_nic_names = remote_nic_names;
 
@@ -3536,14 +3680,26 @@ void MPComm::Impl::acceptLoop() {
             uint32_t name_len = static_cast<uint32_t>(name.size());
             if (send(client_fd, &name_len, sizeof(name_len), 0) != sizeof(name_len)) {
                 MPCOMM_PLOG_ERROR("MPComm: Failed to send nic_name length");
+                if (single_request) {
+                    nic_names_ok = false;
+                    break;
+                }
                 close(client_fd);
                 continue;
             }
             if (name_len > 0 && send(client_fd, name.c_str(), name_len, 0) != static_cast<ssize_t>(name_len)) {
                 MPCOMM_PLOG_ERROR("MPComm: Failed to send nic_name");
+                if (single_request) {
+                    nic_names_ok = false;
+                    break;
+                }
                 close(client_fd);
                 continue;
             }
+        }
+        if (!nic_names_ok) {
+            close(client_fd);
+            continue;
         }
 
         // Build suffix-to-index mapping for remote NICs
@@ -3585,6 +3741,11 @@ void MPComm::Impl::acceptLoop() {
 
         size_t actual_qps = std::min(static_cast<size_t>(qps_per_conn),
                                       static_cast<size_t>(remote_qps_per_conn));
+        if (single_request && actual_qps == 0) {
+            MPCOMM_LOG_ERROR("MPComm: Single-NIC peer advertised zero QPs\n");
+            close(client_fd);
+            continue;
+        }
         MPCOMM_LOG_INFO("MPComm: Passive side: Using %zu QPs per NIC connection\n", actual_qps);
 
         // Check how many distinct NUMA nodes the remote NICs actually span
@@ -3619,10 +3780,10 @@ void MPComm::Impl::acceptLoop() {
         // Calculate expected number of connections (must match active side exactly)
         // Active side: for each local NIC with suffix N, connects to remote NICs with suffix N and cross-NUMA
         // On passive side, we need to calculate how many remote NICs will connect to us
-        size_t expected_connections = 0;
+        size_t expected_connections = single_request ? 1 : 0;
 
         // For each remote NIC (which is the active side's local NIC)
-        for (size_t remote_nic = 0; remote_nic < remote_num_nics; ++remote_nic) {
+        for (size_t remote_nic = 0; !single_request && remote_nic < remote_num_nics; ++remote_nic) {
             int remote_suffix = extractNicSuffix(remote_nic_names[remote_nic]);
 
             // Active side with suffix N will try to connect to local NICs with suffix N and cross-NUMA
@@ -3743,16 +3904,36 @@ void MPComm::Impl::acceptLoop() {
                         destroyQP(created_qp);
                     }
                     qp_list.clear();
-                    connection_skipped = true;
+                    if (single_request) {
+                        uint8_t passive_status = 1;
+                        send(client_fd, &passive_status, sizeof(passive_status), 0);
+                        success = false;
+                    } else {
+                        connection_skipped = true;
+                    }
                     break;
                 }
 
                 // Complete QP setup
                 if (modifyQPToRTR(ctx, qp, remote_info) != 0 ||
                     modifyQPToRTS(qp) != 0) {
+                    if (single_request) {
+                        uint8_t passive_status = 1;
+                        send(client_fd, &passive_status, sizeof(passive_status), 0);
+                    }
                     destroyQP(qp);
                     success = false;
                     break;
+                }
+                if (single_request) {
+                    uint8_t passive_status = 0;
+                    if (send(client_fd, &passive_status, sizeof(passive_status), 0) !=
+                            sizeof(passive_status)) {
+                        MPCOMM_PLOG_ERROR("MPComm: Failed to send passive QP status");
+                        destroyQP(qp);
+                        success = false;
+                        break;
+                    }
                 }
 
                 qp_list.push_back(qp);
@@ -6254,6 +6435,12 @@ int MPComm::init(const std::string &local_host_id,
                  const std::string &device_names,
                  int tcp_port) {
     return impl_->init(local_host_id, device_names, tcp_port);
+}
+
+int MPComm::initSingleNicPair(const std::string &local_host_id,
+                              const std::string &device_name,
+                              int tcp_port) {
+    return impl_->initSingleNicPair(local_host_id, device_name, tcp_port);
 }
 
 void MPComm::shutdown() {

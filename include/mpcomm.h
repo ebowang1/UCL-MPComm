@@ -175,6 +175,16 @@ class MPComm {
              int tcp_port = 0);
 
     /**
+     * Initialize an explicit single-NIC pair, independent of NIC name suffixes.
+     * Both peers must use this API; device_name must name exactly one NIC.
+     * A nonempty MPCOMM_NIC_FILTER must equal device_name.
+     * tcp_port = 0 binds an automatically selected TCP listening port.
+     */
+    int initSingleNicPair(const std::string &local_host_id,
+                          const std::string &device_name,
+                          int tcp_port = 0);
+
+    /**
      * Shutdown and cleanup resources
      */
     void shutdown();

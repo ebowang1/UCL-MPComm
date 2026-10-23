@@ -9,6 +9,7 @@ import queue
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -24,11 +25,45 @@ class FakeWorker:
         self.server = server
         self.events = queue.Queue()
         self.closed = False
+        self.measuring = False
+        self.measured_operations = 0
+        self.round_id = 0
         self.records.append((args.role, server, gpu_memory, self.stream))
         self.events.put({"event": "ready", "stream": self.stream,
                          "port": stream.get("port", peer_port)})
 
     def command(self, text):
+        if self.config["op"] == "read" and not self.server:
+            if text == "start":
+                self.events.put({"event": "rounds_ready", "stream": self.stream})
+            elif text.startswith("round "):
+                round_id = int(text.split()[1])
+                if round_id != self.round_id + 1:
+                    raise ValueError("nonsequential simulated READ round")
+                self.round_id = round_id
+                submitted = time.monotonic_ns()
+                completed = time.monotonic_ns()
+                while completed <= submitted:
+                    completed = time.monotonic_ns()
+                self.events.put({"event": "round_done", "round": round_id, "stream": self.stream,
+                                 "submitted_ns": submitted, "completed_ns": completed,
+                                 "bytes": self.config["size"], "errors": 0})
+                if self.measuring:
+                    self.measured_operations += 1
+            elif text == "warmup_done":
+                self.events.put({"event": "warmup_ready", "stream": self.stream})
+            elif text.startswith("measure "):
+                self.measuring = True
+                self.events.put({"event": "measurement_ready", "stream": self.stream})
+            elif text == "finish":
+                self.events.put({"event": "result", "stream": self.stream,
+                                 "bytes": self.measured_operations * self.config["size"],
+                                 "operations": self.measured_operations, "errors": 0,
+                                 "elapsed_ns": int(self.config["duration"] * 1e9),
+                                 "read_rounds": True, "verified": True})
+            else:
+                raise ValueError(text)
+            return
         if text == "start":
             self.events.put({"event": "warmup_ready", "stream": self.stream})
         elif text.startswith("measure "):
@@ -150,7 +185,8 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(aggregator.add(sample(0, 1, 1000000000, 1000000000)))
         row = aggregator.add(sample(3, 1, 2000000000, 1000000000))
         self.assertEqual(row["total_GB_s"], 3)
-        self.assertEqual(row["skew_ns"], 0)
+        self.assertNotIn("skew_ns", row)
+        self.assertNotIn("max_lag_ns", row)
         aggregator.add(sample(3, 2, 4000000000, 2000000000))
         row = aggregator.add(sample(0, 2, 2000000000, 2000000000))
         self.assertEqual(row["total_GB_s"], 3)
@@ -220,25 +256,29 @@ class ControllerTests(unittest.TestCase):
             bench.summary(config, [], [{"stream": 0}],
                           [{"stream": 0, "verified": False}], None)
 
-    def test_misaligned_sample_skew_is_visible(self):
-        aggregator = bench.Samples([{"gpu": 0}, {"gpu": 1}])
-        aggregator.add({"stream": 0, "window": 1, "bytes": 100, "elapsed_ns": 100})
-        row = aggregator.add({"stream": 1, "window": 1, "bytes": 110, "elapsed_ns": 110})
-        self.assertEqual(row["skew_ns"], 10)
-        self.assertEqual(row["total_GB_s"], 2)
+    def test_synchronized_read_defaults_and_rejects_parallel_rounds(self):
+        argv = ["--role", "receiver", "--peer", "127.0.0.1", "--nics", "mlx5_0"]
+        self.assertEqual(bench.parse_args(argv).inflight, 1)
+        self.assertEqual(bench.parse_args(argv + ["--op", "write"]).inflight, 4)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            bench.parse_args(argv + ["--inflight", "4"])
 
-    def test_delayed_observation_is_not_hidden(self):
-        aggregator = bench.Samples([{"gpu": 0}, {"gpu": 1}])
-        aggregator.add({"stream": 0, "window": 1, "bytes": 100,
-                        "elapsed_ns": 100, "sample_ns": 140})
-        row = aggregator.add({"stream": 1, "window": 1, "bytes": 100,
-                              "elapsed_ns": 100, "sample_ns": 120})
-        self.assertEqual(row["skew_ns"], 20)
-        self.assertEqual(row["max_lag_ns"], 40)
-        self.assertEqual(row["total_GB_s"], 2)
+    def test_bandwidth_output_has_no_skew_or_lag(self):
+        row = {"event": "bandwidth", "elapsed_s": 1, "total_GB_s": 2,
+               "streams": [{"gpu": 0, "GB_s": 1}, {"gpu": 1, "GB_s": 1}],
+               "latency_us": 100, "latency_max_us": 150, "rounds": 8}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            bench.report_sample(row, None)
+        text = output.getvalue()
+        self.assertIn("latency=100.000us", text)
+        self.assertIn("latency_max=150.000us", text)
+        self.assertNotIn("skew", text)
+        self.assertNotIn("lag", text)
 
     def test_completed_counters_only_exclude_drain(self):
-        config = {"streams": [{"gpu": 0}], "op": "read", "verify": "none"}
+        config = {"streams": [{"gpu": 0}], "op": "read", "verify": "none",
+                  "round_summary": {"rounds": 100, "latency_us": 100, "latency_max_us": 150}}
         result = {"stream": 0, "bytes": 1000000000, "elapsed_ns": 1000000000,
                   "operations": 100, "drain_bytes": 9000000000}
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as root:
@@ -278,7 +318,14 @@ class ControllerTests(unittest.TestCase):
                         self.assertFalse(thread.is_alive())
                     self.assertFalse(errors, errors)
                     saved = json.loads(Path(output).read_text(encoding="utf-8"))
-                    self.assertEqual(saved["total_GB_s"], 2)
+                    if operation == "read":
+                        self.assertGreater(saved["round_summary"]["rounds"], 0)
+                        self.assertGreater(saved["round_summary"]["latency_us"], 0)
+                        self.assertEqual({r["operations"] for r in saved["results"]},
+                                         {saved["round_summary"]["rounds"]})
+                    else:
+                        self.assertEqual(saved["total_GB_s"], 2)
+                        self.assertIsNone(saved["round_summary"])
                     self.assertEqual(len(saved["samples"]), 2)
                     self.assertEqual({r["stream"] for r in saved["results"]}, {0, 3})
                     gpu_roles = [r for r in FakeWorker.records if r[2]]
@@ -292,6 +339,114 @@ class ControllerTests(unittest.TestCase):
                         worker.close()
                     left.sock.close()
                     right.sock.close()
+
+
+class ReadRoundTests(unittest.TestCase):
+    @staticmethod
+    def event(gpu, started, completed, round_id=1, size=16):
+        return {"event": "round_done", "stream": gpu, "round": round_id,
+                "submitted_ns": started, "completed_ns": completed, "bytes": size, "errors": 0}
+
+    def test_round_latency_is_full_span_not_max_request_duration(self):
+        events = [self.event(0, 100, 180), self.event(1, 140, 200)]
+        timing = bench.round_timing(events, [{"gpu": 0}, {"gpu": 1}], 1, 16, 90)
+        self.assertEqual(timing["latency_ns"], 100)
+        self.assertNotEqual(timing["latency_ns"], max(180 - 100, 200 - 140))
+
+    def test_one_and_eight_gpu_rounds(self):
+        for count in (1, 8):
+            streams = [{"gpu": i} for i in range(count)]
+            events = [self.event(i, 100 + i * 10, 200 + i * 10) for i in range(count)]
+            timing = bench.round_timing(events, streams, 1, 16, 90)
+            self.assertEqual(timing["latency_ns"], 100 + (count - 1) * 10)
+            self.assertEqual(sum(e["bytes"] for e in events), count * 16)
+
+    def test_missing_duplicate_wrong_round_and_errors(self):
+        streams = [{"gpu": 0}, {"gpu": 1}]
+        valid = [self.event(0, 100, 200), self.event(1, 110, 210)]
+        variants = [valid[:1], [valid[0], valid[0]],
+                    [valid[0], dict(valid[1], round=2)],
+                    [valid[0], dict(valid[1], bytes=15)],
+                    [valid[0], dict(valid[1], errors=1)],
+                    [valid[0], dict(valid[1], completed_ns=100)],
+                    [valid[0], dict(valid[1], submitted_ns=80)]]
+        for events in variants:
+            with self.assertRaises(ValueError):
+                bench.round_timing(events, streams, 1, 16, 90)
+
+    def test_windows_mean_max_and_partial_last_window(self):
+        output = []
+        config = {"duration": 2.5, "interval": 1, "size": 16}
+        reporter = bench.ReadRoundSamples([{"gpu": 0}, {"gpu": 1}], config, 100, output.append)
+        for end, latency in ((500000000, 100000), (900000000, 300000), (2000000000, 200000)):
+            self.assertTrue(reporter.add({"submitted_ns": 100 + end - latency,
+                                          "completed_ns": 100 + end, "latency_ns": latency}))
+        reporter.flush(reporter.duration_ns)
+        self.assertEqual([s["elapsed_s"] for s in output], [1, 2, 2.5])
+        self.assertEqual(output[0]["latency_us"], 200)
+        self.assertEqual(output[0]["latency_max_us"], 300)
+        self.assertEqual(output[1]["rounds"], 0)
+        self.assertIsNone(output[1]["latency_us"])
+        self.assertEqual(output[2]["latency_us"], 200)
+        self.assertEqual(output[2]["streams"][0]["window_ns"], 500000000)
+        self.assertEqual(reporter.result()["rounds"], 3)
+        self.assertEqual(reporter.result()["latency_us"], 200)
+
+    def test_late_round_is_excluded_for_every_gpu(self):
+        output = []
+        reporter = bench.ReadRoundSamples([{"gpu": i} for i in range(8)],
+                                          {"duration": 1, "interval": 1, "size": 16}, 100, output.append)
+        self.assertTrue(reporter.add({"submitted_ns": 200, "completed_ns": 400, "latency_ns": 200}))
+        self.assertFalse(reporter.add({"submitted_ns": 500, "completed_ns": 1000000100,
+                                       "latency_ns": 999999600}))
+        reporter.flush(reporter.duration_ns)
+        self.assertEqual(reporter.result()["rounds"], 1)
+        self.assertEqual(len(output), 1)
+        self.assertTrue(all(s["completed_bytes"] == 16 for s in output[0]["streams"]))
+
+    def test_no_completed_round_outputs_no_fake_zero_latency(self):
+        output = []
+        reporter = bench.ReadRoundSamples([{"gpu": 0}],
+                                          {"duration": 1, "interval": 1, "size": 16}, 100, output.append)
+        reporter.flush(reporter.duration_ns)
+        self.assertIsNone(output[0]["latency_us"])
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text):
+            bench.report_sample(output[0], None)
+        self.assertIn("latency=--", text.getvalue())
+
+    def test_barrier_waits_for_slowest_gpu_before_next_round(self):
+        records = {"submitted": {}, "completed": {}, "next": 1}
+        class BarrierWorker(FakeWorker):
+            def command(self, text):
+                if text.startswith("round "):
+                    round_id = int(text.split()[1])
+                    if round_id > 1:
+                        if records["completed"].get(round_id - 1) != {0, 1}:
+                            raise AssertionError("next round started before all GPU completions")
+                    records["submitted"].setdefault(round_id, set()).add(self.stream)
+                super().command(text)
+
+            def event(self):
+                data = super().event()
+                if data and data["event"] == "round_done":
+                    # GPU1 has no completion visible until both requests were submitted.
+                    if self.stream == 1 and records["submitted"][data["round"]] != {0, 1}:
+                        self.events.put(data)
+                        return None
+                    records["completed"].setdefault(data["round"], set()).add(self.stream)
+                return data
+        args = bench.parse_args(["--role", "receiver", "--peer", "127.0.0.1", "--nics", "mlx5_0",
+                                 "--duration", "0.1", "--interval", "0.1", "--warmup", "0"])
+        streams = [{"gpu": i, "gpu_nic": "mlx5_1"} for i in (0, 1)]
+        config = bench.make_config(args, streams)
+        workers = [BarrierWorker(args, s, config, False, False) for s in streams]
+        for worker in workers:
+            worker.events.get_nowait()
+        result = bench.run_synchronized_read(workers, config, streams, lambda e: None)
+        self.assertGreater(config["round_summary"]["rounds"], 0)
+        self.assertEqual(result[0]["operations"], result[1]["operations"])
+        self.assertTrue(all(group == {0, 1} for group in records["completed"].values()))
 
 
 if __name__ == "__main__":

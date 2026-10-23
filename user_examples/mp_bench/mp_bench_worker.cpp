@@ -131,6 +131,7 @@ struct Options {
     int64_t warmup_ns = 2 * kNsPerSecond, duration_ns = 10 * kNsPerSecond;
     int64_t interval_ns = kNsPerSecond, timeout_ns = 30 * kNsPerSecond;
     int64_t setup_timeout_ns = 120 * kNsPerSecond;
+    bool read_rounds = false;
     size_t total = 0;
 
     static Options parse(int argc, char** argv) {
@@ -138,7 +139,7 @@ struct Options {
             "--role", "--memory", "--op", "--nic", "--gpu", "--numa", "--listen-port",
             "--peer-ip", "--peer-port", "--stream", "--size", "--depth", "--warmup",
             "--duration", "--interval", "--timeout-ms", "--qps", "--chunk", "--outstanding",
-            "--verify", "--setup-timeout"};
+            "--verify", "--setup-timeout", "--read-rounds"};
         std::unordered_map<std::string, std::string> args;
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
@@ -164,6 +165,9 @@ struct Options {
         o.peer_ip = get("--peer-ip", "");
         o.numa = get("--numa", "auto");
         o.verify = get("--verify", "full");
+        const std::string read_rounds = get("--read-rounds", "0");
+        if (read_rounds != "0" && read_rounds != "1") fail("--read-rounds must be 0 or 1");
+        o.read_rounds = read_rounds == "1";
         o.gpu = integerNumber(get("--gpu", "-1"), "--gpu");
         o.stream = integerNumber(get("--stream", o.gpu >= 0 ? std::to_string(o.gpu) : "0"), "--stream");
         o.listen_port = integerNumber(get("--listen-port", "0"), "--listen-port");
@@ -195,6 +199,8 @@ struct Options {
         if (o.role != "server" && o.role != "client") fail("--role must be server or client");
         if (o.memory != "cpu" && o.memory != "gpu") fail("--memory must be cpu or gpu");
         if (o.op != "read" && o.op != "write") fail("--op must be read or write");
+        if (o.read_rounds && (o.op != "read" || o.depth != 1))
+            fail("--read-rounds 1 requires --op read and --depth 1");
         if (o.verify != "none" && o.verify != "full") fail("--verify must be none or full");
         if (o.stream < 0 || o.gpu < -1) fail("--stream must be nonnegative and --gpu must be >= -1");
         if (o.nic.find_first_of(", \t\r\n") != std::string::npos) fail("--nic must name exactly one NIC");
@@ -414,6 +420,7 @@ private:
 struct Slot {
     mpcomm::TransferHandle handle = mpcomm::INVALID_TRANSFER_HANDLE;
     int64_t submitted_ns = 0;
+    int64_t completed_ns = 0;
     bool received = false;
 };
 
@@ -480,6 +487,7 @@ private:
             << ",\"op\":" << jsonString(options_.op) << ",\"pattern\":" << unsigned(options_.pattern())
             << ",\"qps\":" << options_.qps << ",\"chunk\":" << options_.chunk
             << ",\"outstanding\":" << options_.outstanding
+            << ",\"read_rounds\":" << (options_.read_rounds ? "true" : "false")
             << ",\"clock_ns\":" << nowNs() << ",\"allocated_bytes\":" << options_.total
             << ",\"allocated\":true}";
         emit(out.str());
@@ -490,10 +498,10 @@ private:
         out << "{\"event\":" << jsonString(event) << ",\"role\":" << jsonString(options_.role)
             << ",\"stream\":" << options_.stream << ",\"bytes\":" << counts.bytes
             << ",\"operations\":" << counts.operations << ",\"elapsed_ns\":" << elapsed
-            << ",\"sample_ns\":" << last_sample_ns_ << ",\"window\":" << sample_window_
-            << ",\"sampling_skew_ns\":" << (last_sample_ns_ - elapsed) << ",\"errors\":0";
+            << ",\"window\":" << sample_window_ << ",\"errors\":0";
         if (std::strcmp(event, "result") == 0) {
-            out << ",\"drain_bytes\":" << counts.drain_bytes
+            out << ",\"read_rounds\":" << (options_.read_rounds ? "true" : "false")
+                << ",\"drain_bytes\":" << counts.drain_bytes
                 << ",\"drain_operations\":" << counts.drain_operations
                 << ",\"verified\":" << (verified ? verified : "null")
                 << ",\"verification\":" << jsonString(options_.verify == "none" ? "none" :
@@ -532,8 +540,9 @@ private:
             options_.warmup_ns + options_.timeout_ns + 30 * kNsPerSecond);
         for (;;) {
             checkSignal();
-            input_.pump(100);
+            input_.pump(options_.read_rounds ? 10 : 100);
             std::string command;
+            if (options_.read_rounds && input_.eof()) fail("controller stdin EOF before READ rounds finish");
             if (input_.take(command)) return command;
             if (input_.eof()) fail("controller stdin EOF before client command");
             if (nowNs() >= deadline) fail("controller stdin command timed out");
@@ -571,7 +580,8 @@ private:
             fail("transfer observation timeout for slot " + std::to_string(index));
         if (!comm_->isTransferComplete(slot.handle)) return false;
         const int64_t observed_ns = nowNs();
-        if (measured) publishDueSamples(counts, observed_ns);
+        slot.completed_ns = observed_ns;
+        if (measured && !options_.read_rounds) publishDueSamples(counts, observed_ns);
         auto result = comm_->getTransferResult(slot.handle);
         if (result.error_code != mpcomm::MPCOMM_SUCCESS || result.bytes_transferred != options_.size)
             fail("transfer result for slot " + std::to_string(index) + ": error=" +
@@ -580,7 +590,7 @@ private:
         comm_->releaseTransfer(slot.handle);
         slot.handle = mpcomm::INVALID_TRANSFER_HANDLE;
         slot.received = true;
-        if (measured && observed_ns >= deadline) {
+        if (measured && !options_.read_rounds && observed_ns >= deadline) {
             addCount(counts.drain_bytes, result.bytes_transferred);
             addCount(counts.drain_operations, 1);
         } else {
@@ -653,6 +663,81 @@ private:
         memory_.verify(options_);
     }
 
+    void runReadRounds() {
+        if (waitCommand() != "start") fail("READ rounds expected stdin command: start");
+        emit("{\"event\":\"rounds_ready\",\"stream\":" + std::to_string(options_.stream) + "}");
+        enum class Phase { Warmup, AwaitMeasure, Measured };
+        Phase phase = Phase::Warmup;
+        Counts phase_counts;
+        uint64_t last_round = 0;
+        const std::string round_prefix = "round ";
+        const std::string measure_prefix = "measure ";
+        for (;;) {
+            const std::string command = waitCommand();
+            if (command.rfind(round_prefix, 0) == 0) {
+                if (phase == Phase::AwaitMeasure)
+                    fail("READ rounds expected measure before the next round");
+                const uint64_t round = unsignedNumber(command.substr(round_prefix.size()), "round id");
+                if (last_round == std::numeric_limits<uint64_t>::max() || round != last_round + 1)
+                    fail("READ round IDs must be positive and consecutive from 1");
+                const bool measured = phase == Phase::Measured;
+                if (measured && nowNs() < measurement_start_ns_)
+                    fail("READ measurement round arrived before measurement start");
+                next_control_ns_ = 0;
+                submit(0);
+                for (;;) {
+                    checkController();
+                    if (complete(0, phase_counts, false, 0)) break;
+                }
+                last_round = round;
+                const Slot& slot = slots_[0];
+                std::ostringstream out;
+                out << "{\"event\":\"round_done\",\"stream\":" << options_.stream
+                    << ",\"round\":" << round << ",\"submitted_ns\":" << slot.submitted_ns
+                    << ",\"completed_ns\":" << slot.completed_ns
+                    << ",\"bytes\":" << options_.size << ",\"errors\":0}";
+                emit(out.str());
+            } else if (command == "warmup_done") {
+                if (phase != Phase::Warmup) fail("READ warmup_done is only valid during warmup");
+                if (phase_counts.operations == 0) fail("READ warmup requires at least one completed round");
+                verifyRead();
+                phase = Phase::AwaitMeasure;
+                emit("{\"event\":\"warmup_ready\",\"stream\":" + std::to_string(options_.stream) +
+                     ",\"operations\":" + std::to_string(phase_counts.operations) +
+                     ",\"verified\":" + (options_.verify == "full" ? "true" : "null") + "}");
+            } else if (command.rfind(measure_prefix, 0) == 0) {
+                if (phase != Phase::AwaitMeasure)
+                    fail("READ measure is only valid once, after warmup_done");
+                const uint64_t raw_start = unsignedNumber(command.substr(measure_prefix.size()), "measure start_ns");
+                if (raw_start > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - options_.duration_ns))
+                    fail("measurement deadline overflows int64 nanoseconds");
+                const int64_t start = static_cast<int64_t>(raw_start);
+                const int64_t now = nowNs();
+                if (start <= now) fail("measurement start must be in the future on CLOCK_MONOTONIC");
+                if (start - now > std::max(options_.setup_timeout_ns,
+                    options_.warmup_ns + options_.timeout_ns + 30 * kNsPerSecond))
+                    fail("measurement start is beyond the controller barrier timeout");
+                phase_counts = Counts{};
+                measurement_start_ns_ = start;
+                phase = Phase::Measured;
+                emit("{\"event\":\"measurement_ready\",\"stream\":" + std::to_string(options_.stream) +
+                     ",\"start_ns\":" + std::to_string(start) + "}");
+            } else if (command == "finish") {
+                if (phase != Phase::Measured) fail("READ finish requires measurement phase");
+                if (nowNs() < measurement_start_ns_ + options_.duration_ns)
+                    fail("READ finish arrived before the measurement deadline");
+                if (phase_counts.operations == 0) fail("READ measurement requires at least one completed round");
+                verifyRead();
+                shutdown();
+                report("result", phase_counts, options_.duration_ns,
+                       options_.verify == "full" ? "true" : nullptr);
+                return;
+            } else {
+                fail("unexpected READ rounds command: " + command);
+            }
+        }
+    }
+
     void runClient() {
         checkComm(comm_->connect(kServerHost, options_.peer_ip, options_.peer_port), "connect");
         checkComm(comm_->queryRemoteBufferByNuma(kServerHost, options_.peer_ip, options_.peer_port, -1, remote_),
@@ -664,6 +749,10 @@ private:
         checkComm(comm_->updateRemoteMemoryInfo(kServerHost, remote_.rkeys), "updateRemoteMemoryInfo");
         slots_.resize(options_.depth);
         ready();
+        if (options_.read_rounds) {
+            runReadRounds();
+            return;
+        }
         if (waitCommand() != "start") fail("client expected stdin command: start");
         Counts warmup;
         const int64_t warmup_start = nowNs();

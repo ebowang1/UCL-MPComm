@@ -10,18 +10,23 @@ Start B (GPU source) first:
   python3 mp_bench.py --role source --bind 0.0.0.0 --port 18515 --gpus 0,1,2,3
 Start A (CPU receiver):
   python3 mp_bench.py --role receiver --peer <B-IP> --port 18515 \
-      --nics mlx5_bond_1 --op read --request-size 16M --inflight 4 \
+      --nics mlx5_bond_1 --op read --request-size 16M --inflight 1 \
       --duration 60 --warmup 5 --interval 1 --numa auto
 Use --op write on A for B-initiated writes into A CPU memory (same data direction).
 B --gpu-count N selects the first N visible CUDA devices; --gpus lists exact IDs.
 B --nics optionally restricts automatic PCIe-nearest NIC selection.
 A --data-ip can advertise a different address for B to reach A in WRITE mode.
-A --json PATH saves samples and final results. Counts are successful completion
-observations in the native worker, not physical-port RX counters or hardware CQE
-timestamps. Sample boundaries are aligned on the initiating host; skew_ns and
-max_lag_ns expose delayed sampling. A descheduled worker has no new observations
-in missed windows; do not interpret such windows as hardware port idleness.
-Verification is outside measurement. No SSH, installation, or system network
+A --json PATH saves samples and final results. READ uses synchronized rounds:
+one request per GPU, all requests complete before the next round (inflight=1).
+Round latency = latest native completion observation minus earliest native
+submission start, in microseconds on A's CLOCK_MONOTONIC; it is not the maximum
+of independently started request durations. Output latency is the mean across
+completed rounds in each sample window, with latency_max also reported. Warmup
+and a final round completing after the deadline are excluded. Python IPC/barrier
+coordination affects throughput; timing excludes result delivery after native
+completion but includes staggered submissions. These are software-observed
+completion times, not hardware CQE timestamps. WRITE retains continuous refill
+and does not report synchronized READ latency. Verification is outside measurement. No SSH, installation, or system network
 changes are performed. With Mellanox NICs, optionally build with -DUSE_MLNX=ON.
 Use Python >=3.8, CMake >=3.18 and a C++17 compiler. GPU B also needs CUDA Driver
 headers/libraries and working GPUDirect memory registration (nvidia-peermem).
@@ -197,7 +202,8 @@ class Worker:
                    "--interval", str(config["interval"]), "--timeout-ms", str(config["timeout_ms"]),
                    "--setup-timeout", str(args.setup_timeout),
                    "--qps", str(config["qps"]), "--chunk", str(config["chunk"]),
-                   "--outstanding", str(config["outstanding"]), "--verify", config["verify"]]
+                   "--outstanding", str(config["outstanding"]), "--verify", config["verify"],
+                   "--read-rounds", "1" if config["op"] == "read" else "0"]
         if server:
             command += ["--listen-port", str(stream["port"])]
         else:
@@ -272,7 +278,7 @@ class Worker:
             handle.close()
 
 
-def wait_events(workers, expected, timeout, check=None):
+def wait_events(workers, expected, timeout, check=None, pause=0.002):
     pending = {w.stream: w for w in workers}
     results = {}
     deadline = time.monotonic() + timeout
@@ -289,7 +295,8 @@ def wait_events(workers, expected, timeout, check=None):
                 raise ValueError(f"GPU {stream}: expected {expected}, got {data['event']}")
             results[stream] = data
             del pending[stream]
-        time.sleep(0.002)
+        if pending:
+            time.sleep(pause)
     return [results[w.stream] for w in workers]
 
 
@@ -320,31 +327,169 @@ class Samples:
             return None
         if window != self.last_window + 1:
             raise ValueError("missing sample window")
-        rows, elapsed, observed, lags = [], [], [], []
+        rows, elapsed = [], []
         for spec in self.streams:
             gpu = spec["gpu"]
             data = bucket[gpu]
             total, ns = int(data["bytes"]), int(data["elapsed_ns"])
-            sample_ns = int(data.get("sample_ns", ns))
             old_bytes, old_ns = self.previous[gpu]
-            if total < old_bytes or ns <= old_ns or sample_ns < ns or int(data.get("errors", 0)):
+            if total < old_bytes or ns <= old_ns or int(data.get("errors", 0)):
                 raise ValueError("invalid completion counters")
             bw = (total - old_bytes) / (ns - old_ns)
             rows.append({"gpu": gpu, "GB_s": bw, "completed_bytes": total,
-                         "window_bytes": total - old_bytes, "window_ns": ns - old_ns,
-                         "sampling_lag_ns": sample_ns - ns})
+                         "window_bytes": total - old_bytes, "window_ns": ns - old_ns})
             elapsed.append(ns)
-            observed.append(sample_ns)
-            lags.append(sample_ns - ns)
             self.previous[gpu] = (total, ns)
         self.last_window = window
         del self.pending[window]
         return {"event": "bandwidth", "window": window, "elapsed_s": max(elapsed) / 1e9,
-                "skew_ns": max(observed) - min(observed), "max_lag_ns": max(lags),
                 "streams": rows, "total_GB_s": sum(r["GB_s"] for r in rows)}
 
 
+def round_timing(events, streams, round_id, request_size, dispatched_ns):
+    expected = {s["gpu"] for s in streams}
+    if len(events) != len(expected) or {e.get("stream") for e in events} != expected:
+        raise ValueError("READ round does not contain every configured GPU exactly once")
+    starts, ends = [], []
+    for event in events:
+        if event.get("event") != "round_done" or event.get("round") != round_id:
+            raise ValueError("incorrect READ round identity")
+        if type(event.get("bytes")) is not int or event["bytes"] != request_size or event.get("errors", 0):
+            raise ValueError("READ round transfer failed or has incorrect byte count")
+        submitted, completed = event.get("submitted_ns"), event.get("completed_ns")
+        if type(submitted) is not int or type(completed) is not int or submitted < dispatched_ns or completed <= submitted:
+            raise ValueError("invalid native READ round timestamps")
+        starts.append(submitted)
+        ends.append(completed)
+    return {"submitted_ns": min(starts), "completed_ns": max(ends),
+            "latency_ns": max(ends) - min(starts)}
+
+
+class ReadRoundSamples:
+    def __init__(self, streams, config, start_ns, emit):
+        self.streams, self.config, self.start_ns, self.emit = streams, config, start_ns, emit
+        self.duration_ns = int(config["duration"] * 1e9)
+        self.interval_ns = int(config["interval"] * 1e9)
+        self.next_boundary = min(self.interval_ns, self.duration_ns)
+        self.last_boundary = 0
+        self.window = 0
+        self.rounds = self.latency_sum_ns = self.latency_max_ns = 0
+        self.window_rounds = self.window_sum_ns = self.window_max_ns = 0
+
+    def flush(self, elapsed_ns):
+        while self.next_boundary <= self.duration_ns and elapsed_ns >= self.next_boundary:
+            self.window += 1
+            window_ns = self.next_boundary - self.last_boundary
+            window_bytes = self.window_rounds * self.config["size"]
+            rows = [{"gpu": s["gpu"], "GB_s": window_bytes / window_ns,
+                     "completed_bytes": self.rounds * self.config["size"],
+                     "window_bytes": window_bytes, "window_ns": window_ns} for s in self.streams]
+            self.emit({"event": "bandwidth", "window": self.window,
+                       "elapsed_s": self.next_boundary / 1e9, "streams": rows,
+                       "total_GB_s": sum(r["GB_s"] for r in rows),
+                       "rounds": self.window_rounds,
+                       "latency_us": self.window_sum_ns / self.window_rounds / 1000 if self.window_rounds else None,
+                       "latency_max_us": self.window_max_ns / 1000 if self.window_rounds else None})
+            self.last_boundary = self.next_boundary
+            self.window_rounds = self.window_sum_ns = self.window_max_ns = 0
+            if self.next_boundary == self.duration_ns:
+                self.next_boundary = self.duration_ns + 1
+            else:
+                self.next_boundary += min(self.interval_ns, self.duration_ns - self.next_boundary)
+
+    def add(self, timing):
+        elapsed = timing["completed_ns"] - self.start_ns
+        if timing["submitted_ns"] < self.start_ns or elapsed < 0:
+            raise ValueError("READ round started before measurement")
+        self.flush(min(elapsed, self.duration_ns))
+        if elapsed >= self.duration_ns:
+            return False
+        self.rounds += 1
+        self.window_rounds += 1
+        latency = timing["latency_ns"]
+        self.latency_sum_ns += latency
+        self.window_sum_ns += latency
+        self.latency_max_ns = max(self.latency_max_ns, latency)
+        self.window_max_ns = max(self.window_max_ns, latency)
+        return True
+
+    def result(self):
+        return {"rounds": self.rounds,
+                "latency_us": self.latency_sum_ns / self.rounds / 1000 if self.rounds else None,
+                "latency_max_us": self.latency_max_ns / 1000 if self.rounds else None,
+                "latency_definition": "max(native completed_ns) - min(native submitted_ns)",
+                "mode": "synchronized_read"}
+
+
+def run_synchronized_read(workers, config, streams, emit, check=None):
+    if config["depth"] != 1:
+        raise ValueError("synchronized READ requires --inflight 1")
+    for worker in workers:
+        worker.command("start")
+    wait_events(workers, "rounds_ready", config["timeout_ms"] / 1000 + 30, check)
+    sequence = 0
+
+    def execute_round():
+        nonlocal sequence
+        sequence += 1
+        dispatched = time.monotonic_ns()
+        for worker in workers:
+            worker.command(f"round {sequence}")
+        events = wait_events(workers, "round_done", config["timeout_ms"] / 1000 + 10, check, pause=0)
+        timing = round_timing(events, streams, sequence, config["size"], dispatched)
+        if timing["completed_ns"] > time.monotonic_ns():
+            raise ValueError("native READ round timestamp is ahead of the controller clock")
+        return timing
+
+    warmup_deadline = time.monotonic_ns() + int(config["warmup"] * 1e9)
+    execute_round()
+    while time.monotonic_ns() < warmup_deadline:
+        execute_round()
+    for worker in workers:
+        worker.command("warmup_done")
+    wait_events(workers, "warmup_ready", config["timeout_ms"] / 1000 + 30, check)
+    start_ns = time.monotonic_ns() + 200_000_000
+    for worker in workers:
+        worker.command(f"measure {start_ns}")
+    wait_events(workers, "measurement_ready", config["timeout_ms"] / 1000 + 30, check)
+    emit({"event": "measurement_start", "message": "warmup complete"})
+    while time.monotonic_ns() < start_ns:
+        if check:
+            check()
+        time.sleep(min(0.001, max(0, start_ns - time.monotonic_ns()) / 1e9))
+    reporter = ReadRoundSamples(streams, config, start_ns, emit)
+    deadline = start_ns + reporter.duration_ns
+    drained_rounds = 0
+    while time.monotonic_ns() < deadline:
+        timing = execute_round()
+        if not reporter.add(timing):
+            drained_rounds += 1
+    reporter.flush(reporter.duration_ns)
+    if reporter.rounds == 0:
+        raise RuntimeError("no READ round completed on all GPUs before the deadline")
+    for worker in workers:
+        worker.command("finish")
+    results = wait_events(workers, "result", config["timeout_ms"] / 1000 + 30, check)
+    for worker in workers:
+        worker.successful_exit()
+    expected_ops = reporter.rounds + drained_rounds
+    for result in results:
+        if result.get("read_rounds") is not True or result.get("errors", 0):
+            raise RuntimeError("native worker did not complete synchronized READ")
+        if result.get("operations") != expected_ops or result.get("bytes") != expected_ops * config["size"]:
+            raise RuntimeError("native completion counters disagree with synchronized READ rounds")
+        result["bytes"] = reporter.rounds * config["size"]
+        result["operations"] = reporter.rounds
+        result["drain_bytes"] = drained_rounds * config["size"]
+        result["drain_operations"] = drained_rounds
+        result["elapsed_ns"] = reporter.duration_ns
+    config["round_summary"] = reporter.result()
+    return results
+
+
 def run_clients(workers, config, streams, emit, check=None):
+    if config["op"] == "read":
+        return run_synchronized_read(workers, config, streams, emit, check)
     for worker in workers:
         worker.command("start")
     wait_events(workers, "warmup_ready", config["warmup"] + config["timeout_ms"] / 1000 + 30, check)
@@ -405,6 +550,8 @@ def validate_config(config, count):
         value = config.get(name)
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f"invalid {name}")
+    if config["op"] == "read" and config["depth"] != 1:
+        raise ValueError("synchronized READ requires --inflight 1")
     if config["qps"] * config["outstanding"] > 1024:
         raise ValueError("qps * outstanding exceeds the single-NIC CQ capacity (1024)")
     for name, low, high in (("duration", 0.1, 86400), ("warmup", 0, 3600), ("interval", 0.01, 3600)):
@@ -456,8 +603,10 @@ def print_mapping(config):
     shared = len({s["gpu_nic"] for s in config["streams"]}) < len(config["streams"])
     if shared:
         print("  NOTE: some GPUs share the same nearest NIC; this is not one NIC per GPU.", flush=True)
-    print("  Completion-based payload bandwidth (GB/s); per-GPU aligned windows, "
-          "TOTAL=sum(per-GPU rates); skew is reported.\n", flush=True)
+    print("  Completion-based payload bandwidth (GB/s); TOTAL=sum(per-GPU rates).", flush=True)
+    if config["op"] == "read":
+        print("  Synchronized READ: one request/GPU/round; latency=min submit to max completion. "
+              "Python IPC/barrier overhead affects throughput.\n", flush=True)
 
 
 def report_sample(data, samples):
@@ -469,9 +618,14 @@ def report_sample(data, samples):
     if samples is not None:
         samples.append(data)
     detail = "  ".join(f"GPU{r['gpu']}={r['GB_s']:.3f}" for r in data["streams"])
-    print(f"[{data['elapsed_s']:8.3f}s] {detail}  TOTAL={data['total_GB_s']:.3f} GB/s "
-          f"skew={data['skew_ns'] / 1e6:.3f}ms "
-          f"lag={data.get('max_lag_ns', 0) / 1e6:.3f}ms", flush=True)
+    timing = ""
+    if "latency_us" in data:
+        if data["latency_us"] is None:
+            timing = "  latency=-- latency_max=-- rounds=0"
+        else:
+            timing = (f"  latency={data['latency_us']:.3f}us "
+                      f"latency_max={data['latency_max_us']:.3f}us rounds={data['rounds']}")
+    print(f"[{data['elapsed_s']:8.3f}s] {detail}  TOTAL={data['total_GB_s']:.3f} GB/s{timing}", flush=True)
 
 
 def summary(config, samples, results, server_results, output):
@@ -496,15 +650,24 @@ def summary(config, samples, results, server_results, output):
               f"ops={r['operations']}, drain_bytes={r.get('drain_bytes', 0)}", flush=True)
     print(f"  TOTAL: {total:.3f} GB/s; verification={config['verify']} "
           f"({'PASS' if config['verify'] == 'full' else 'DISABLED'})", flush=True)
+    round_summary = config.get("round_summary")
+    if config["op"] == "read":
+        if not round_summary or round_summary["rounds"] <= 0:
+            raise RuntimeError("synchronized READ has no completed round latency samples")
+        if any(r["operations"] != round_summary["rounds"] for r in results):
+            raise RuntimeError("per-GPU operations disagree with completed READ rounds")
+        print(f"  READ rounds={round_summary['rounds']}, latency={round_summary['latency_us']:.3f}us "
+              f"latency_max={round_summary['latency_max_us']:.3f}us", flush=True)
     if output:
         Path(output).write_text(json.dumps({"config": config, "samples": samples,
                                            "results": results, "server_results": server_results,
+                                           "round_summary": round_summary,
                                            "total_GB_s": total}, indent=2, allow_nan=False), encoding="utf-8")
 
 
 def source_session(args, control, peer_ip, workers):
     streams = selected_gpus(args)
-    control.send({"event": "hello", "version": 1, "streams": streams})
+    control.send({"event": "hello", "version": 2, "streams": streams})
     config = control.expect("config", args.setup_timeout)["config"]
     validate_config(config, len(streams))
     for chosen, offered in zip(config["streams"], streams):
@@ -558,8 +721,8 @@ def source_session(args, control, peer_ip, workers):
 
 def receiver_session(args, control, workers):
     hello = control.expect("hello", args.setup_timeout)
-    if hello.get("version") != 1:
-        raise ValueError("benchmark control version mismatch")
+    if hello.get("version") != 2:
+        raise ValueError("benchmark control version mismatch; update both hosts")
     config = make_config(args, hello["streams"])
     print_mapping(config)
     control.send({"event": "config", "config": config})
@@ -641,7 +804,8 @@ def parse_args(argv=None):
     selection.add_argument("--gpu-count", type=int)
     parser.add_argument("--op", choices=("read", "write"), default="read", help="selected on A")
     parser.add_argument("--request-size", type=size_arg, default=16 * 1024 * 1024)
-    parser.add_argument("--inflight", type=int, default=4, help="requests per GPU (independent slots)")
+    parser.add_argument("--inflight", type=int, default=None,
+                        help="requests per GPU: READ requires 1 (default); WRITE defaults to 4")
     parser.add_argument("--duration", type=float, default=60)
     parser.add_argument("--warmup", type=float, default=5)
     parser.add_argument("--interval", type=float, default=1)
@@ -654,6 +818,10 @@ def parse_args(argv=None):
     parser.add_argument("--verify", choices=("full", "none"), default="full")
     parser.add_argument("--json", help="A optional result JSON path")
     args = parser.parse_args(argv)
+    if args.inflight is None:
+        args.inflight = 1 if args.op == "read" else 4
+    if args.role == "receiver" and args.op == "read" and args.inflight != 1:
+        parser.error("synchronized READ requires --inflight 1")
     if not 1 <= args.port <= 65535 or not math.isfinite(args.setup_timeout) or not 1 <= args.setup_timeout <= 3600:
         parser.error("invalid port/setup timeout")
     if args.data_port is None:

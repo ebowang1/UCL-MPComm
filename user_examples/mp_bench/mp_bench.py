@@ -41,6 +41,26 @@ Use Python >=3.8, CMake >=3.18 and a C++17 compiler. GPU B also needs CUDA Drive
 headers/libraries and working GPUDirect memory registration (nvidia-peermem).
 CPU NUMA binding uses mbind; denied syscalls/memory placement fail explicitly.
 
+OQ tests (A --op read, exactly one A NIC). OQ = outstanding READ WQEs of the A NIC,
+summed over all QPs and GPU connections, set at runtime through the experimental
+MPComm per-NIC limit (the static cap is --qps * --outstanding, default 4 * 16 = 64).
+--total-bytes (decimal: 5G = 5e9 bytes, default) is split evenly across the GPUs;
+every GPU issues ONE getAsync for its share and all are issued together.
+  --mode sweep : for each --oq-list value (default 1,4,16,64), --repeat times
+                 (default 3): set the limit, wait until applied, read total-bytes.
+                 Reports completion latency (first submit -> last completion),
+                 total bandwidth and per-GPU bandwidth (share / own completion time).
+  --mode switch: a native thread toggles the limit between --high-oq and --low-oq
+                 (0 pauses posting) every --high-ms / --low-ms while total-bytes is
+                 read repeatedly, until each direction switched --switches times.
+                 Reports p50/p99 of T1 (set -> worker adopted), T_down (set -> last
+                 WQE posted under the old limit completed), T_90 (rate stays within
+                 10% of the new level) and T_up (rate stays >= 90% of high level),
+                 from completed bytes per --bin-us bin. Switches whose phases cross
+                 a transfer boundary are excluded.
+chunk (--chunk) is fixed per process: run one session per GPU count x chunk.
+Keep A receive buffers on the NIC NUMA (--numa auto): the limit is per worker.
+
 Ports: B control --port plus B --data-port+i (READ); A --data-port+i (WRITE).
 Default data base is 18516 on B and 19516 on A. Open these TCP ports for metadata,
 and ensure RDMA reachability between every selected pair. --timeout-ms bounds
@@ -58,13 +78,18 @@ import queue
 import re
 import select
 import socket
+import statistics
 import subprocess
 import sys
 import threading
 import time
+from typing import Any, Dict
 
 MAX_FRAME = 1024 * 1024
 MAX_STREAMS = 16
+PROTOCOL_VERSION = 3
+MODES = ("rounds", "sweep", "switch")
+NIC_LIMIT_NONE = 0xFFFFFFFF
 
 
 def size_arg(text):
@@ -76,6 +101,32 @@ def size_arg(text):
     if value > (1 << 40):
         raise argparse.ArgumentTypeError("size must not exceed 1 TiB")
     return value
+
+
+def decimal_size_arg(text):
+    """Decimal units: 5G = 5e9 bytes, 640M = 640e6; KiB/MiB/GiB/TiB stay binary."""
+    match = re.fullmatch(r"([1-9][0-9]*)([KMGT])?(iB|B)?", str(text).strip(), re.I)
+    binary = bool(match) and (match.group(3) or "").lower() == "ib"
+    if not match or (binary and not match.group(2)):
+        raise argparse.ArgumentTypeError("total size must be positive bytes or e.g. 5G (=5e9), 640M, 5GiB")
+    unit = (match.group(2) or "").upper()
+    value = int(match.group(1)) * (1024 if binary else 1000) ** ("KMGT".index(unit) + 1 if unit else 0)
+    if value > MAX_STREAMS * (1 << 40):
+        raise argparse.ArgumentTypeError("total size must not exceed 16 TiB")
+    return value
+
+
+def oq_list_arg(text):
+    values = [part.strip() for part in str(text).split(",")]
+    if not 1 <= len(values) <= 64 or not all(v.isdigit() and int(v) > 0 for v in values):
+        raise argparse.ArgumentTypeError("OQ list must be 1..64 positive integers, e.g. 1,4,16,64")
+    return [int(v) for v in values]
+
+
+def transfer_shares(total, count):
+    """Per-GPU bytes of total: remainder bytes go to the first GPUs."""
+    base, remainder = divmod(total, count)
+    return [base + (1 if i < remainder else 0) for i in range(count)]
 
 
 def csv_arg(text):
@@ -313,8 +364,16 @@ class ReadClient(NativeProcess):
             raise ValueError("one source port is required per GPU stream")
         spec = ",".join(f"{s['gpu']}:{s['cpu_nic']}:{port}" for s, port in zip(streams, ports))
         command = [str(args.worker), "--role", "client", "--memory", "cpu", "--op", "read",
-                   "--streams", spec, "--peer-ip", peer_ip, "--depth", "1", "--read-rounds", "1"]
+                   "--streams", spec, "--peer-ip", peer_ip, "--depth", "1", "--read-rounds", "1",
+                   "--mode", config["mode"]]
         command += common_native_options(args, config)
+        if config["mode"] != "rounds":
+            command += ["--total-bytes", str(config["total_bytes"]),
+                        "--oq-list", ",".join(str(v) for v in config["oq_list"]),
+                        "--repeat", str(config["repeat"]),
+                        "--high-oq", str(config["high_oq"]), "--low-oq", str(config["low_oq"]),
+                        "--high-ms", str(config["high_ms"]), "--low-ms", str(config["low_ms"]),
+                        "--switches", str(config["switches"]), "--bin-us", str(config["bin_us"])]
         super().__init__(command, "A READ receiver")
 
 
@@ -603,7 +662,313 @@ def stop_servers(workers, config):
     return results
 
 
-def validate_config(config, count):
+# ---------------------------------------------------------------- OQ tests (sweep/switch)
+
+def percentile(values, pct):
+    """Nearest-rank percentile; None when there are no values."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(pct / 100 * len(ordered)) - 1)]
+
+
+def collect_until(client, config, terminal, handle, check=None):
+    """Feed native events to handle() until the terminal event; fail after a silent gap."""
+    timeout_s = config["timeout_ms"] / 1000
+    if config["mode"] == "switch":
+        idle_limit = config["switches"] * (config["high_ms"] + config["low_ms"]) / 1000 + 3 * timeout_s + 120
+    else:
+        idle_limit = 2 * timeout_s + 120
+    client.command("start")
+    last = time.monotonic()
+    while True:
+        if check:
+            check()
+        data = client.event()
+        if data is None:
+            if time.monotonic() - last > idle_limit:
+                raise TimeoutError(f"no event from {client.label} for {idle_limit:.0f}s")
+            time.sleep(0.001)
+            continue
+        last = time.monotonic()
+        if data["event"] == terminal:
+            return data
+        handle(data)
+
+
+def sweep_row(event, streams, shares):
+    """One sweep measurement: latency, total and per-GPU bandwidth (bytes/ns = GB/s)."""
+    items = per_stream(event, "streams", streams)
+    submitted, completed, latency = event.get("submitted_ns"), event.get("completed_ns"), event.get("latency_ns")
+    if not all(type(v) is int for v in (submitted, completed, latency)) or latency <= 0 or \
+            completed - submitted != latency:
+        raise ValueError("invalid sweep timing")
+    per_gpu = []
+    for item, share in zip(items, shares):
+        elapsed = item.get("completed_ns", 0) - submitted
+        if item.get("bytes") != share or elapsed <= 0 or elapsed > latency:
+            raise ValueError(f"GPU {item['stream']}: invalid sweep bytes/completion")
+        per_gpu.append({"gpu": item["stream"], "bytes": share, "elapsed_ns": elapsed, "GB_s": share / elapsed})
+    return {"oq": event.get("oq"), "repeat": event.get("repeat"), "latency_ns": latency,
+            "latency_ms": latency / 1e6, "total_GB_s": sum(shares) / latency, "streams": per_gpu}
+
+
+def print_sweep_row(row):
+    detail = "  ".join(f"GPU{s['gpu']}={s['GB_s']:.3f}" for s in row["streams"])
+    print(f"[OQ={row['oq']:>4} #{row['repeat']}] latency={row['latency_ms']:10.3f} ms  "
+          f"TOTAL={row['total_GB_s']:8.3f} GB/s  {detail}", flush=True)
+
+
+def summarize_sweep(rows):
+    """Mean over repeats for every OQ, in the order measured."""
+    summary = []
+    for oq in dict.fromkeys(r["oq"] for r in rows):
+        group = [r for r in rows if r["oq"] == oq]
+        gpus = [s["gpu"] for s in group[0]["streams"]]
+        summary.append({"oq": oq, "repeats": len(group),
+                        "latency_ms": statistics.mean(r["latency_ms"] for r in group),
+                        "total_GB_s": statistics.mean(r["total_GB_s"] for r in group),
+                        "per_gpu_GB_s": {g: statistics.mean(r["streams"][i]["GB_s"] for r in group)
+                                         for i, g in enumerate(gpus)}})
+    return summary
+
+
+def run_sweep(client, config, check=None):
+    streams = config["streams"]
+    shares = transfer_shares(config["total_bytes"], len(streams))
+    rows = []
+
+    def handle(data):
+        if data["event"] == "warmup_done":
+            print(f"Warmup done ({data.get('latency_ns', 0) / 1e6:.3f} ms, excluded).", flush=True)
+        elif data["event"] == "sweep_result":
+            row = sweep_row(data, streams, shares)
+            if row["oq"] not in config["oq_list"]:
+                raise ValueError("sweep result for an unexpected OQ")
+            rows.append(row)
+            print_sweep_row(row)
+        else:
+            raise ValueError(f"unexpected sweep event: {data['event']}")
+
+    done = collect_until(client, config, "sweep_done", handle, check)
+    client.successful_exit()
+    expected = len(config["oq_list"]) * config["repeat"]
+    if len(rows) != expected or done.get("runs") != expected:
+        raise RuntimeError(f"sweep produced {len(rows)} of {expected} measurements")
+    if done.get("posting_workers") != 1:
+        raise RuntimeError("more than one MPComm worker posted; OQ results are invalid")
+    if config["verify"] == "full" and done.get("verified") is not True:
+        raise RuntimeError("READ data verification failed")
+    return {"mode": "sweep", "rows": rows, "summary": summarize_sweep(rows),
+            "verified": done.get("verified"), "posting_workers": done.get("posting_workers")}
+
+
+def _bin_rate(bins, k, bin_ns):
+    return (bins[k] if 0 <= k < len(bins) else 0) / bin_ns
+
+
+def _level(bins, origin, bin_ns, start, end):
+    """Median rate (GB/s) of the full bins inside [start, end)."""
+    first = -(-(start - origin) // bin_ns)
+    last = (end - origin) // bin_ns
+    rates = [_bin_rate(bins, k, bin_ns) for k in range(first, last)]
+    return statistics.median(rates) if rates else None
+
+
+def _settle_ns(bins, origin, bin_ns, t0, t_next, ok):
+    """Time from t0 after which every full bin before t_next satisfies ok(rate)."""
+    first = (t0 - origin) // bin_ns
+    last = (t_next - origin) // bin_ns
+    settled = first
+    for k in range(first, last):
+        if not ok(_bin_rate(bins, k, bin_ns)):
+            settled = k + 1
+    if settled >= last:
+        return None
+    return max(0, origin + settled * bin_ns - t0)
+
+
+def analyze_switch(origin, bin_ns, bins, events, transfers, high, low):
+    """events: [generation, limit, set_ns, applied_ns, drained_ns]; transfers: [submitted, completed]."""
+    result: Dict[str, Any] = {kind: {"samples": [], "excluded": 0} for kind in ("down", "up")}
+    for i in range(1, len(events) - 1):
+        prev, cur, nxt = events[i - 1], events[i], events[i + 1]
+        if cur[1] == low and prev[1] == high:
+            kind = "down"
+        elif cur[1] == high and prev[1] == low:
+            kind = "up"
+        else:
+            continue
+        t_prev, t0, t_next = prev[2], cur[2], nxt[2]
+        bucket = result[kind]
+        if not any(s <= t_prev and t_next <= c for s, c in transfers):
+            bucket["excluded"] += 1  # a transfer boundary inside the window would fake a rate change
+            continue
+        before = _level(bins, origin, bin_ns, t0 - (t0 - t_prev) // 2, t0)
+        after = _level(bins, origin, bin_ns, t_next - (t_next - t0) // 2, t_next)
+        if before is None or after is None:
+            bucket["excluded"] += 1
+            continue
+        sample = {"generation": cur[0], "t0_ns": t0, "before_GB_s": before, "after_GB_s": after,
+                  "T1_us": (cur[3] - t0) / 1e3 if cur[3] else None}
+        if kind == "down":
+            sample["T_down_us"] = (cur[4] - t0) / 1e3 if cur[4] else None
+            sample["T_90_us"] = None
+            drop = before - after
+            if before > 0 and drop >= 0.1 * before:
+                threshold = before - 0.9 * drop
+                settled = _settle_ns(bins, origin, bin_ns, t0, t_next, lambda r: r <= threshold)
+                sample["T_90_us"] = None if settled is None else settled / 1e3
+        else:
+            sample["T_up_us"] = None
+            if after > 0 and after - before >= 0.1 * after:
+                threshold = 0.9 * after
+                settled = _settle_ns(bins, origin, bin_ns, t0, t_next, lambda r: r >= threshold)
+                sample["T_up_us"] = None if settled is None else settled / 1e3
+        bucket["samples"].append(sample)
+    metrics = {"down": ("T1_us", "T_down_us", "T_90_us", "before_GB_s", "after_GB_s"),
+               "up": ("T1_us", "T_up_us", "before_GB_s", "after_GB_s")}
+    for kind, bucket in result.items():
+        bucket["stats"] = {}
+        for metric in metrics[kind]:
+            values = [s[metric] for s in bucket["samples"] if s.get(metric) is not None]
+            bucket["stats"][metric] = {"count": len(values), "p50": percentile(values, 50),
+                                       "p99": percentile(values, 99)}
+    return result
+
+
+def _assemble(chunks, expected, name):
+    items = []
+    for offset in sorted(chunks):
+        if offset != len(items):
+            raise ValueError(f"{name} chunks are not contiguous")
+        items.extend(chunks[offset])
+    if len(items) != expected:
+        raise ValueError(f"expected {expected} {name}, got {len(items)}")
+    return items
+
+
+def run_switch(client, config, check=None):
+    state: Dict[str, Any] = {"meta": None, "trace_transfers": {}, "trace_events": {}, "trace_bins": {}}
+    fields = {"trace_transfers": "transfers", "trace_events": "events", "trace_bins": "bytes"}
+
+    def handle(data):
+        event = data["event"]
+        if event == "warmup_done":
+            print(f"Warmup done ({data.get('latency_ns', 0) / 1e6:.3f} ms, excluded); switching...", flush=True)
+        elif event == "trace_meta":
+            state["meta"] = data
+        elif event in fields:
+            offset = data.get("offset")
+            if type(offset) is not int or offset in state[event] or not isinstance(data.get(fields[event]), list):
+                raise ValueError(f"invalid {event} chunk")
+            state[event][offset] = data[fields[event]]
+        else:
+            raise ValueError(f"unexpected switch event: {event}")
+
+    done = collect_until(client, config, "switch_done", handle, check)
+    client.successful_exit()
+    meta = state["meta"]
+    if not meta:
+        raise RuntimeError("switch test produced no trace")
+    if done.get("posting_workers") != 1:
+        raise RuntimeError("more than one MPComm worker posted; switching results are invalid")
+    if config["verify"] == "full" and done.get("verified") is not True:
+        raise RuntimeError("READ data verification failed")
+    if meta.get("dropped_events"):
+        raise RuntimeError(f"trace dropped {meta['dropped_events']} limit events")
+    if meta.get("dropped_completions"):
+        raise RuntimeError(f"trace dropped {meta['dropped_completions']} completions; switching statistics are invalid")
+    transfers = _assemble(state["trace_transfers"], meta["transfers"], "transfers")
+    events = _assemble(state["trace_events"], meta["events"], "events")
+    bins = _assemble(state["trace_bins"], meta["bins"], "bins")
+    analysis = analyze_switch(meta["origin_ns"], meta["bin_ns"], bins, events, transfers,
+                              config["high_oq"], config["low_oq"])
+    return {"mode": "switch", "meta": meta, "transfers": transfers, "events": events, "bins": bins,
+            "analysis": analysis, "verified": done.get("verified"), "posting_workers": done.get("posting_workers")}
+
+
+def _fmt(value, digits=1):
+    return "--" if value is None else f"{value:.{digits}f}"
+
+
+def print_limit_summary(config, output):
+    count = len(config["streams"])
+    print(f"\nFinal summary: {config['mode']} | {count} GPU | total={config['total_bytes']} B | "
+          f"chunk={config['chunk']} B | qps={config['qps']} | static cap={config['qps'] * config['outstanding']}",
+          flush=True)
+    if output["mode"] == "sweep":
+        gpus = [s["gpu"] for s in config["streams"]]
+        print("  OQ   latency(ms)   TOTAL(GB/s)   " + "  ".join(f"GPU{g}(GB/s)" for g in gpus), flush=True)
+        for item in output["summary"]:
+            per_gpu = "  ".join(f"{item['per_gpu_GB_s'][g]:11.3f}" for g in gpus)
+            print(f"  {item['oq']:<4} {item['latency_ms']:12.3f}  {item['total_GB_s']:12.3f}   {per_gpu}", flush=True)
+        print(f"  (mean of {config['repeat']} repeats; verification={config['verify']})", flush=True)
+        return
+    analysis = output["analysis"]
+    print(f"  high OQ={config['high_oq']} ({config['high_ms']} ms)  low OQ={config['low_oq']} "
+          f"({config['low_ms']} ms)  bin={config['bin_us']} us", flush=True)
+    names = {"down": f"Down {config['high_oq']}->{config['low_oq']}", "up": f"Up {config['low_oq']}->{config['high_oq']}"}
+    for kind in ("down", "up"):
+        bucket = analysis[kind]
+        stats = bucket["stats"]
+        print(f"  {names[kind]}: samples={len(bucket['samples'])} excluded={bucket['excluded']}  level "
+              f"{_fmt(stats['before_GB_s']['p50'], 3)} -> {_fmt(stats['after_GB_s']['p50'], 3)} GB/s (p50)",
+              flush=True)
+        for metric in (("T1_us", "T_down_us", "T_90_us") if kind == "down" else ("T1_us", "T_up_us")):
+            s = stats[metric]
+            print(f"    {metric[:-3]:<7} p50={_fmt(s['p50']):>9} us  p99={_fmt(s['p99']):>9} us  (n={s['count']})",
+                  flush=True)
+
+
+def limit_test_summary(config, output, server_results, path):
+    expected = {s["gpu"] for s in config["streams"]}
+    if {r["stream"] for r in server_results} != expected or len(server_results) != len(expected):
+        raise ValueError("not all GPU sources were stopped")
+    print_limit_summary(config, output)
+    if path:
+        Path(path).write_text(json.dumps({"config": config, "result": output, "server_results": server_results},
+                                         indent=2, allow_nan=False), encoding="utf-8")
+
+
+def session_timeout(config: Dict[str, Any], setup_timeout: float) -> float:
+    """How long B waits for A to finish the selected test."""
+    timeout_s = config["timeout_ms"] / 1000
+    if config["mode"] == "sweep":
+        return setup_timeout + 120 + (len(config["oq_list"]) * config["repeat"] + 1) * timeout_s
+    if config["mode"] == "switch":
+        return setup_timeout + 120 + config["switches"] * (config["high_ms"] + config["low_ms"]) / 1000 + 3 * timeout_s
+    return config["duration"] + config["warmup"] + 2 * timeout_s + setup_timeout + 60
+
+
+def validate_limit_settings(settings, count, qps, outstanding):
+    """Checks of the sweep/switch settings shared by A (arguments) and B (received config)."""
+    total = settings.get("total_bytes")
+    if type(total) is not int or not count <= total <= MAX_STREAMS * (1 << 40):
+        raise ValueError("total_bytes must give every GPU at least one byte")
+    cap = qps * outstanding
+    oq_list = settings.get("oq_list")
+    oq_cap = cap if settings.get("mode") == "sweep" else 256
+    if not isinstance(oq_list, list) or not 1 <= len(oq_list) <= 64 or \
+            any(type(v) is not int or not 1 <= v <= oq_cap for v in oq_list):
+        raise ValueError(f"OQ list values must be in [1, qps * outstanding = {cap}]")
+    for name, low, high in (("repeat", 1, 100), ("switches", 1, 100000), ("bin_us", 1, 10000),
+                            ("high_oq", 1, cap if settings.get("mode") == "switch" else 256)):
+        if type(settings.get(name)) is not int or not low <= settings[name] <= high:
+            raise ValueError(f"{name} must be in [{low}, {high}]")
+    low_oq = settings.get("low_oq")
+    if type(low_oq) is not int or not 0 <= low_oq < settings["high_oq"]:
+        raise ValueError("low OQ must be in [0, high OQ)")
+    for name in ("high_ms", "low_ms"):
+        value = settings.get(name)
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0.001 <= value <= 60000:
+            raise ValueError(f"{name} must be in [0.001, 60000] ms")
+
+
+LIMIT_KEYS = ("total_bytes", "oq_list", "repeat", "high_oq", "low_oq", "high_ms", "low_ms", "switches", "bin_us")
+
+
+def validate_config(config: Dict[str, Any], count: int):
     if not isinstance(config, dict) or config.get("op") not in ("read", "write"):
         raise ValueError("invalid operation")
     for name, low, high in (("size", 1, 1 << 40), ("depth", 1, 1024),
@@ -639,33 +1004,65 @@ def validate_config(config, count):
         for field in ("gpu_nic", "cpu_nic"):
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(stream.get(field, ""))):
                 raise ValueError(f"invalid {field}")
+    mode = config.get("mode")
+    if mode not in MODES:
+        raise ValueError("invalid test mode")
+    if mode != "rounds":
+        if config["op"] != "read":
+            raise ValueError("sweep/switch modes require --op read")
+        if len({s["cpu_nic"] for s in streams}) != 1:
+            raise ValueError("sweep/switch modes require exactly one A NIC")
+        validate_limit_settings(config, count, config["qps"], config["outstanding"])
+        if config["size"] != transfer_shares(config["total_bytes"], count)[0]:
+            raise ValueError("size must equal the largest per-GPU share of total_bytes")
 
 
-def make_config(args, streams):
+def make_config(args, streams) -> Dict[str, Any]:
     if not isinstance(streams, list) or not streams:
         raise ValueError("source offered no GPU streams")
     if len(args.nics) > len(streams):
         raise ValueError("A has more selected NICs than GPU streams; some NICs would be unused")
     for i, stream in enumerate(streams):
         stream["cpu_nic"] = args.nics[i % len(args.nics)]
-    config = {"op": args.op, "size": args.request_size, "depth": args.inflight,
+    config = {"op": args.op, "mode": args.mode, "size": args.request_size, "depth": args.inflight,
               "duration": args.duration, "warmup": args.warmup, "interval": args.interval,
               "numa": args.numa, "qps": args.qps, "chunk": args.chunk,
               "outstanding": args.outstanding, "timeout_ms": args.timeout_ms,
               "verify": args.verify, "streams": streams}
+    if args.mode != "rounds":
+        config.update({key: getattr(args, key) for key in LIMIT_KEYS})
+        # B allocates the largest share per GPU; A reads exactly each GPU's share.
+        config["size"] = transfer_shares(args.total_bytes, len(streams))[0]
     validate_config(config, len(streams))
     return config
 
 
 def print_mapping(config):
-    print(f"\n{config['op'].upper()} | GPU HBM (B) -> CPU DRAM (A) | "
-          f"request={config['size']} B, inflight/GPU={config['depth']}, "
-          f"warmup={config['warmup']}s, duration={config['duration']}s", flush=True)
+    mode = config.get("mode", "rounds")
+    if mode == "rounds":
+        print(f"\n{config['op'].upper()} | GPU HBM (B) -> CPU DRAM (A) | "
+              f"request={config['size']} B, inflight/GPU={config['depth']}, "
+              f"warmup={config['warmup']}s, duration={config['duration']}s", flush=True)
+    else:
+        shares = transfer_shares(config["total_bytes"], len(config["streams"]))
+        print(f"\nREAD {mode.upper()} | GPU HBM (B) -> CPU DRAM (A) | total={config['total_bytes']} B "
+              f"({len(shares)} GPU, {min(shares)}..{max(shares)} B each, one getAsync per GPU) | "
+              f"chunk={config['chunk']} B, qps={config['qps']}, static cap={config['qps'] * config['outstanding']}",
+              flush=True)
+        if mode == "sweep":
+            print(f"  OQ list={config['oq_list']}, repeat={config['repeat']}", flush=True)
+        else:
+            print(f"  toggle OQ {config['high_oq']} ({config['high_ms']} ms) <-> {config['low_oq']} "
+                  f"({config['low_ms']} ms), switches/direction={config['switches']}, bin={config['bin_us']} us",
+                  flush=True)
     for s in config["streams"]:
         print(f"  GPU{s['gpu']} [{s['pci']}] -> B:{s['gpu_nic']} -> A:{s['cpu_nic']}", flush=True)
     shared = len({s["gpu_nic"] for s in config["streams"]}) < len(config["streams"])
     if shared:
         print("  NOTE: some GPUs share the same nearest NIC; this is not one NIC per GPU.", flush=True)
+    if mode != "rounds":
+        print("  OQ = outstanding READ WQEs of the A NIC (all QPs and GPUs together).\n", flush=True)
+        return
     print("  Completion-based payload bandwidth (GB/s); TOTAL=sum(per-GPU rates).", flush=True)
     if config["op"] == "read":
         print("  Synchronized READ in ONE A communication process: one getAsync per GPU per round; "
@@ -730,14 +1127,14 @@ def summary(config, samples, results, server_results, output):
 
 def source_session(args, control, peer_ip, workers):
     streams = selected_gpus(args)
-    control.send({"event": "hello", "version": 2, "streams": streams})
+    control.send({"event": "hello", "version": PROTOCOL_VERSION, "streams": streams})
     config = control.expect("config", args.setup_timeout)["config"]
     validate_config(config, len(streams))
     for chosen, offered in zip(config["streams"], streams):
         if chosen["gpu"] != offered["gpu"] or chosen["gpu_nic"] != offered["gpu_nic"]:
             raise ValueError("receiver attempted to change GPU affinity selection")
     print_mapping(config)
-    timeout = config["duration"] + config["warmup"] + 2 * config["timeout_ms"] / 1000 + args.setup_timeout + 60
+    timeout = session_timeout(config, args.setup_timeout)
     if config["op"] == "read":
         if args.data_port + len(streams) - 1 > 65535:
             raise ValueError("source data port range exceeds 65535")
@@ -784,12 +1181,13 @@ def source_session(args, control, peer_ip, workers):
 
 def receiver_session(args, control, workers):
     hello = control.expect("hello", args.setup_timeout)
-    if hello.get("version") != 2:
+    if hello.get("version") != PROTOCOL_VERSION:
         raise ValueError("benchmark control version mismatch; update both hosts")
     config = make_config(args, hello["streams"])
     print_mapping(config)
     control.send({"event": "config", "config": config})
     samples = [] if args.json else None
+    limit_output = None
     if config["op"] == "read":
         prepared = control.expect("prepared", args.setup_timeout)
         if len(prepared["streams"]) != len(config["streams"]):
@@ -805,7 +1203,7 @@ def receiver_session(args, control, workers):
         for stream, item in zip(config["streams"], per_stream(ready, "streams", config["streams"])):
             stream["cpu_numa"] = item["numa"]
             print(f"  GPU{stream['gpu']} CPU receive pool: A:{stream['cpu_nic']} "
-                  f"NUMA={item['numa']}", flush=True)
+                  f"NUMA={item['numa']}, {item.get('bytes')} B", flush=True)
         print(f"  A READ receiver: 1 process, {ready.get('instances')} MPComm instance(s), "
               f"{len(config['streams'])} connection(s)", flush=True)
 
@@ -816,8 +1214,13 @@ def receiver_session(args, control, workers):
                 return
             raise RuntimeError(f"unexpected peer event: {event}")
 
-        results = run_synchronized_read(client, config, config["streams"],
-                                        lambda d: report_sample(d, samples), check_peer)
+        if config["mode"] == "sweep":
+            limit_output = run_sweep(client, config, check_peer)
+        elif config["mode"] == "switch":
+            limit_output = run_switch(client, config, check_peer)
+        else:
+            results = run_synchronized_read(client, config, config["streams"],
+                                            lambda d: report_sample(d, samples), check_peer)
         control.send({"event": "finish"})
         server_results = control.expect("server_results", config["timeout_ms"] / 1000 + 30)["results"]
     else:
@@ -853,6 +1256,9 @@ def receiver_session(args, control, workers):
         server_results = stop_servers(workers, config)
         control.send({"event": "finish"})
         control.expect("finished", args.setup_timeout)
+    if limit_output is not None:
+        limit_test_summary(config, limit_output, server_results, args.json)
+        return
     summary(config, samples, results, server_results, args.json)
 
 
@@ -879,16 +1285,41 @@ def parse_args(argv=None):
     parser.add_argument("--numa", default="auto", help="A CPU buffer NUMA: auto or node ID")
     parser.add_argument("--qps", type=int, default=4)
     parser.add_argument("--chunk", type=size_arg, default=65536)
-    parser.add_argument("--outstanding", type=int, default=8)
+    parser.add_argument("--outstanding", type=int, default=None,
+                        help="static per-QP cap: 16 for sweep/switch (cap 4*16=64), else 8")
     parser.add_argument("--timeout-ms", type=int, default=30000)
     parser.add_argument("--setup-timeout", type=float, default=120)
     parser.add_argument("--verify", choices=("full", "none"), default="full")
     parser.add_argument("--json", help="A optional result JSON path")
+    limit = parser.add_argument_group("OQ tests (A, --op read)")
+    limit.add_argument("--mode", choices=MODES, default="rounds",
+                       help="rounds (synchronized rounds) | sweep (OQ -> bandwidth) | switch (switching cost)")
+    limit.add_argument("--total-bytes", type=decimal_size_arg, default=5 * 10 ** 9,
+                       help="bytes read per measurement, split across GPUs (decimal: 5G = 5e9)")
+    limit.add_argument("--oq-list", type=oq_list_arg, default=[1, 4, 16, 64], help="sweep: NIC OQ values")
+    limit.add_argument("--repeat", type=int, default=3, help="sweep: measurements per OQ")
+    limit.add_argument("--high-oq", type=int, default=64, help="switch: full-speed NIC OQ")
+    limit.add_argument("--low-oq", type=int, default=1, help="switch: reduced NIC OQ (0 = pause)")
+    limit.add_argument("--high-ms", type=float, default=2.0, help="switch: high phase length")
+    limit.add_argument("--low-ms", type=float, default=2.0, help="switch: low phase length")
+    limit.add_argument("--switches", type=int, default=100, help="switch: minimum switches per direction")
+    limit.add_argument("--bin-us", type=int, default=100, help="switch: completed-bytes bin width")
     args = parser.parse_args(argv)
+    if args.outstanding is None:
+        args.outstanding = 16 if args.mode != "rounds" else 8
     if args.inflight is None:
         args.inflight = 1 if args.op == "read" else 4
     if args.role == "receiver" and args.op == "read" and args.inflight != 1:
         parser.error("synchronized READ requires --inflight 1")
+    if args.role == "receiver" and args.mode != "rounds":
+        if args.op != "read":
+            parser.error("--mode sweep/switch requires --op read")
+        if args.nics and len(args.nics) != 1:
+            parser.error("--mode sweep/switch requires exactly one A NIC in --nics")
+        try:
+            validate_limit_settings(vars(args), 1, args.qps, args.outstanding)
+        except ValueError as error:
+            parser.error(str(error))
     if not 1 <= args.port <= 65535 or not math.isfinite(args.setup_timeout) or not 1 <= args.setup_timeout <= 3600:
         parser.error("invalid port/setup timeout")
     if args.data_port is None:

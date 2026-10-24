@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -130,19 +131,27 @@ NumaUniquePtr<T> make_numa_unique(int numa_node) {
     return NumaUniquePtr<T>(obj, NumaDeleter<T>{sizeof(T)});
 }
 
+// wr_id layout: [63:60] NIC | [59:56] QP | [55:48] NIC-limit generation tag |
+//               [47:32] transfer handle | [31:0] chunk index
+static_assert(kMaxNics <= 16 && kMaxQPsPerNic <= 16, "wr_id NIC/QP fields are 4 bits wide");
+
 struct WrIdEncoding {
-    static constexpr uint64_t NIC_SHIFT = 56;
-    static constexpr uint64_t QP_SHIFT = 48;
+    static constexpr uint64_t NIC_SHIFT = 60;
+    static constexpr uint64_t QP_SHIFT = 56;
+    static constexpr uint64_t TAG_SHIFT = 48;
     static constexpr uint64_t HANDLE_SHIFT = 32;
     static constexpr uint64_t CHUNK_MASK = 0xFFFFFFFFULL;
     static constexpr uint64_t HANDLE_MASK = 0xFFFFULL;
-    static constexpr uint64_t QP_MASK = 0xFFULL;
-    static constexpr uint64_t NIC_MASK = 0xFFULL;
+    static constexpr uint64_t TAG_MASK = 0xFFULL;
+    static constexpr uint64_t QP_MASK = 0xFULL;
+    static constexpr uint64_t NIC_MASK = 0xFULL;
 
     static inline uint64_t encode(size_t nic_index, size_t qp_index,
-                                  TransferHandle handle, size_t chunk_index) {
+                                  TransferHandle handle, size_t chunk_index,
+                                  uint32_t tag = 0) {
         return (static_cast<uint64_t>(nic_index & NIC_MASK) << NIC_SHIFT) |
                (static_cast<uint64_t>(qp_index & QP_MASK) << QP_SHIFT) |
+               (static_cast<uint64_t>(tag & TAG_MASK) << TAG_SHIFT) |
                (static_cast<uint64_t>(handle & HANDLE_MASK) << HANDLE_SHIFT) |
                (chunk_index & CHUNK_MASK);
     }
@@ -153,6 +162,10 @@ struct WrIdEncoding {
 
     static inline size_t decodeQp(uint64_t wr_id) {
         return static_cast<size_t>((wr_id >> QP_SHIFT) & QP_MASK);
+    }
+
+    static inline uint32_t decodeTag(uint64_t wr_id) {
+        return static_cast<uint32_t>((wr_id >> TAG_SHIFT) & TAG_MASK);
     }
 
     static inline TransferHandle decodeHandle(uint64_t wr_id) {
@@ -538,6 +551,66 @@ struct LockFreeQueue {
     }
 };
 
+// ==================== Experimental per-NIC outstanding limit ====================
+
+static inline int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static inline void atomicMaxI64(std::atomic<int64_t>& target, int64_t value) {
+    int64_t current = target.load(std::memory_order_relaxed);
+    while (current < value &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+    }
+}
+
+// (generation << 32) | limit, so workers read both atomically.
+static inline uint64_t packNicLimit(uint32_t generation, uint32_t limit) {
+    return (static_cast<uint64_t>(generation) << 32) | limit;
+}
+
+// Trace buffer of one NIC. Never freed while workers run: retired buffers are
+// kept until shutdown so a worker holding a stale pointer stays safe.
+struct NicLimitTraceBuffer {
+    struct Event {
+        uint32_t generation = 0;
+        uint32_t limit = 0;
+        int64_t set_ns = 0;
+        std::atomic<int64_t> applied_ns{0};
+        std::atomic<int64_t> drained_ns{0};
+    };
+
+    size_t nic = 0;
+    uint32_t first_generation = 0;
+    int64_t origin_ns = 0;
+    uint32_t bin_ns = 1;
+    size_t max_bins = 0;
+    size_t max_events = 0;
+    std::unique_ptr<std::atomic<uint64_t>[]> bins;
+    std::unique_ptr<Event[]> events;
+    std::atomic<size_t> event_count{0};
+    std::atomic<uint64_t> dropped_events{0};
+    std::atomic<uint64_t> dropped_completions{0};
+
+    void recordBytes(int64_t now_ns, uint64_t bytes) {
+        const int64_t offset = now_ns - origin_ns;
+        if (offset < 0) return;
+        const uint64_t bin = static_cast<uint64_t>(offset) / bin_ns;
+        if (bin < max_bins) bins[bin].fetch_add(bytes, std::memory_order_relaxed);
+        else dropped_completions.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Raise applied_ns or drained_ns of generations in (after, up_to] to now_ns.
+    void mark(uint32_t after, uint32_t up_to, int64_t now_ns, bool applied) {
+        const int64_t count = static_cast<int64_t>(event_count.load(std::memory_order_acquire));
+        const int64_t lo = std::max<int64_t>(static_cast<int32_t>(after - first_generation) + 1, 0);
+        const int64_t hi = std::min<int64_t>(static_cast<int32_t>(up_to - first_generation), count - 1);
+        for (int64_t i = lo; i <= hi; ++i)
+            atomicMaxI64(applied ? events[i].applied_ns : events[i].drained_ns, now_ns);
+    }
+};
+
 class MPComm::Impl {
  public:
     Impl();
@@ -592,6 +665,13 @@ class MPComm::Impl {
     int waitTransfer(TransferHandle handle, int timeout_ms);
     TransferResult getTransferResult(TransferHandle handle);
     void releaseTransfer(TransferHandle handle);
+
+    // Experimental per-NIC outstanding limit
+    int setNicOutstandingLimit(size_t nic_index, uint32_t limit);
+    int getNicLimitState(size_t nic_index, NicLimitState &out) const;
+    int waitNicLimitApplied(size_t nic_index, int timeout_ms);
+    int startNicLimitTrace(size_t nic_index, uint32_t bin_ns, size_t max_bins, size_t max_events);
+    int stopNicLimitTrace(NicLimitTrace &out);
 
     size_t getNumNics() const { return nic_contexts_.size(); }
     const std::string &getLocalHostId() const { return local_host_id_; }
@@ -722,11 +802,56 @@ class MPComm::Impl {
         TransferHandle handle;
         TransferContext* ctx;
     };
+
+    // Experimental per-NIC outstanding limit, worker-local view (owned by one worker).
+    // out_by_tag counts this worker's outstanding WQEs per generation tag; live_gens
+    // keeps adopted generations in order while older ones still have WQEs in flight.
+    struct WorkerLimitView {
+        uint64_t seen_version = ~0ULL;
+        size_t limit[kMaxNics];
+        uint32_t generation[kMaxNics];
+        uint32_t out_by_tag[kMaxNics][256];
+        std::deque<uint32_t> live_gens[kMaxNics];
+
+        WorkerLimitView() {
+            for (size_t nic = 0; nic < kMaxNics; ++nic) {
+                limit[nic] = SIZE_MAX;
+                generation[nic] = 0;
+                std::fill(std::begin(out_by_tag[nic]), std::end(out_by_tag[nic]), 0u);
+                live_gens[nic].push_back(0);
+            }
+        }
+
+        void posted(size_t nic) { ++out_by_tag[nic][generation[nic] & 0xFF]; }
+        uint32_t tag(size_t nic) const { return generation[nic] & 0xFF; }
+    };
+
+    // Published by each worker, read by getNicLimitState/waitNicLimitApplied.
+    struct alignas(64) WorkerLimitShared {
+        std::atomic<uint32_t> applied_generation[kMaxNics];
+        std::atomic<uint64_t> outstanding[kMaxNics];
+        std::atomic<uint64_t> posted[kMaxNics];
+
+        WorkerLimitShared() {
+            for (size_t nic = 0; nic < kMaxNics; ++nic) {
+                applied_generation[nic].store(0, std::memory_order_relaxed);
+                outstanding[nic].store(0, std::memory_order_relaxed);
+                posted[nic].store(0, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    void adoptNicLimits(size_t worker_id, WorkerLimitView& view, size_t num_nics,
+                        const size_t (&posted)[kMaxNics], const size_t (&completed)[kMaxNics]);
+    void advanceNicLimitDrain(WorkerLimitView& view, size_t nic, NicLimitTraceBuffer* trace);
+    void resetNicLimits();
+
     int pollAllNicsForWorker(int numa_id,
                              const std::vector<size_t>& poll_nic_indices,
                              size_t (&worker_nic_completed)[kMaxNics],
                              size_t (&worker_nic_qp_completed)[kMaxNics][kMaxQPsPerNic],
-                             const std::vector<ActiveContextInfo>& active_ctx_info);
+                             const std::vector<ActiveContextInfo>& active_ctx_info,
+                             WorkerLimitView& limits);
     void finalizeTransferStats(TransferContext& ctx);
 
     // Member variables
@@ -805,6 +930,14 @@ class MPComm::Impl {
     size_t max_idle_spins_;
     int max_send_wr_;
     size_t max_outstanding_per_qp_;
+
+    // Experimental per-NIC outstanding limit state
+    std::array<std::atomic<uint64_t>, kMaxNics> nic_limit_packed_;  // packNicLimit(gen, limit)
+    std::atomic<uint64_t> nic_limit_version_{0};                    // bumped on every change
+    mutable std::mutex nic_limit_mutex_;
+    std::vector<std::unique_ptr<WorkerLimitShared>> worker_limit_shared_;
+    std::atomic<NicLimitTraceBuffer*> nic_limit_trace_{nullptr};
+    std::vector<std::unique_ptr<NicLimitTraceBuffer>> nic_limit_traces_;  // freed at shutdown
 
     bool initialized_;
     bool single_nic_pair_;
@@ -956,6 +1089,8 @@ MPComm::Impl::Impl()
       single_nic_pair_(false),
       transfer_stats_interval_(0),
       transfer_stats_counter_(0) {
+    resetNicLimits();
+
     // Read max RDMA transfer size from environment variable
     const char* env_val = std::getenv(kMaxRdmaTransferSizeEnvVar);
     if (env_val && env_val[0] != '\0') {
@@ -1243,6 +1378,12 @@ int MPComm::Impl::init(const std::string &local_host_id,
         numa_worker_rr_[i] = std::make_unique<std::atomic<size_t>>(0);
     }
 
+    // Per-worker published state of the experimental NIC outstanding limit
+    worker_limit_shared_.clear();
+    for (size_t i = 0; i < total_workers_; ++i) {
+        worker_limit_shared_.push_back(std::make_unique<WorkerLimitShared>());
+    }
+
     // Get CPU list for each NUMA node
     std::vector<std::vector<int>> numa_cpus(num_numa_nodes_);
     for (size_t numa = 0; numa < num_numa_nodes_; ++numa) {
@@ -1426,6 +1567,15 @@ void MPComm::Impl::shutdown() {
         worker_queues_.clear();
         numa_worker_rr_.clear();
         MPCOMM_LOG_INFO("MPComm: All %zu worker threads stopped\n", total_workers_);
+    }
+
+    // Workers are joined: limit/trace state can be released safely.
+    {
+        std::lock_guard<std::mutex> lock(nic_limit_mutex_);
+        nic_limit_trace_.store(nullptr, std::memory_order_release);
+        nic_limit_traces_.clear();
+        worker_limit_shared_.clear();
+        resetNicLimits();
     }
 
     if (listen_fd_ >= 0) {
@@ -5053,6 +5203,10 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
     size_t worker_nic_qp_posted[kMaxNics][kMaxQPsPerNic] = {};
     size_t worker_nic_qp_completed[kMaxNics][kMaxQPsPerNic] = {};
 
+    // Experimental per-NIC outstanding limit: worker-local snapshot of the limits.
+    auto limit_view = std::make_unique<WorkerLimitView>();
+    WorkerLimitView& lv = *limit_view;
+
     // Active context set: contexts currently being processed by this worker.
     // Contexts are added when popped from the queue, removed when all chunks are completed.
     struct ActiveContext {
@@ -5244,9 +5398,10 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
 
                 // Copy is done — try to post RDMA
 
-                // Flow control: check NIC outstanding (same as direct NICs)
+                // Flow control: check NIC outstanding (same as direct NICs),
+                // including the experimental dynamic NIC limit.
                 size_t outstanding = worker_nic_posted[nic] - worker_nic_completed[nic];
-                if (outstanding >= max_outstanding_per_nic) break;
+                if (outstanding >= std::min(max_outstanding_per_nic, lv.limit[nic])) break;
 
                 // Select QP with lowest outstanding
                 size_t qp_index = 0;
@@ -5303,7 +5458,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 struct ibv_send_wr p_wr;
                 memset(&p_wr, 0, sizeof(p_wr));
                 p_wr.wr_id = WrIdEncoding::encode(nic, qp_index,
-                                                   ctx.handle, ci);
+                                                   ctx.handle, ci, lv.tag(nic));
                 p_wr.opcode = IBV_WR_RDMA_WRITE;
                 p_wr.sg_list = &p_sge;
                 p_wr.num_sge = 1;
@@ -5324,6 +5479,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
 
                 worker_nic_posted[nic]++;
                 worker_nic_qp_posted[nic][qp_index]++;
+                lv.posted(nic);
                 ctx.per_nic_posted[nic]++;
                 ctx.per_nic_qp_posted[nic][qp_index]++;
                 ctx.per_nic_bytes[nic] += ck.length;
@@ -5380,6 +5536,9 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             maybeInjectFault(fi, num_nics);
             maybeRecoverFault(fi);
         }
+
+        // Experimental per-NIC outstanding limit: adopt changes and publish counters.
+        adoptNicLimits(worker_id, lv, num_nics, worker_nic_posted, worker_nic_completed);
 
         // ---- Phase 1: Drain new handles from the queue into active set ----
         // PXN concurrency cap: when too many PXN contexts are active, defer
@@ -5627,6 +5786,12 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                             continue;
                         }
 
+                        // Experimental dynamic NIC limit 0: no new WQE on this NIC
+                        // (direct or proxy); completions keep being polled.
+                        if (lv.limit[nic] == 0) {
+                            continue;
+                        }
+
                         size_t eff_outstanding;
                         size_t eff_max;
                         if (ctx.pxn_enabled && ctx.pxn_is_proxy_nic[nic]) {
@@ -5643,7 +5808,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                                       proxy_pipeline_depth * num_active_pxn_transfers;
                         } else {
                             eff_outstanding = worker_nic_posted[nic] - worker_nic_completed[nic];
-                            eff_max = max_outstanding_per_nic;
+                            eff_max = std::min(max_outstanding_per_nic, lv.limit[nic]);
                         }
 
                         if (eff_outstanding < eff_max && eff_outstanding < min_eff_outstanding) {
@@ -5762,7 +5927,8 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
 
                 struct ibv_send_wr wr;
                 memset(&wr, 0, sizeof(wr));
-                wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx);
+                wr.wr_id = WrIdEncoding::encode(best_nic, qp_index, ctx.handle, chunk_idx,
+                                                lv.tag(best_nic));
                 wr.opcode = (ctx.direction == TransferDirection::GATHER) ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
                 wr.sg_list = &sge;
                 wr.num_sge = 1;
@@ -5783,6 +5949,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
                 // Update worker-level flow control counters
                 worker_nic_posted[best_nic]++;
                 worker_nic_qp_posted[best_nic][qp_index]++;
+                lv.posted(best_nic);
 
                 // Update per-context counters (for stats and per-context completion tracking)
                 ctx.per_nic_posted[best_nic]++;
@@ -5859,7 +6026,7 @@ void MPComm::Impl::workerThreadLoop(size_t worker_id, int numa_id, std::vector<i
             int poll_ret = pollAllNicsForWorker(numa_id, poll_nic_indices,
                                                 worker_nic_completed,
                                                 worker_nic_qp_completed,
-                                                active_ctx_info);
+                                                active_ctx_info, lv);
             auto t_poll1 = std::chrono::steady_clock::now();
             for (auto& ac2 : active_contexts) {
                 if (ac2.ctx->pxn_enabled) {
@@ -6153,10 +6320,12 @@ int MPComm::Impl::pollAllNicsForWorker(
     const std::vector<size_t>& poll_nic_indices,
     size_t (&worker_nic_completed)[kMaxNics],
     size_t (&worker_nic_qp_completed)[kMaxNics][kMaxQPsPerNic],
-    const std::vector<ActiveContextInfo>& active_ctx_info) {
+    const std::vector<ActiveContextInfo>& active_ctx_info,
+    WorkerLimitView& limits) {
     const int poll_batch_size = static_cast<int>(poll_batch_size_);
-    struct ibv_wc wc_array[64];
+    struct ibv_wc wc_array[256];
     size_t num_nics = nic_contexts_.size();
+    NicLimitTraceBuffer* trace = nic_limit_trace_.load(std::memory_order_acquire);
 
     for (size_t nic : poll_nic_indices) {
         auto &nic_ctx = *nic_contexts_[nic];
@@ -6165,6 +6334,9 @@ int MPComm::Impl::pollAllNicsForWorker(
             MPCOMM_LOG_ERROR("MPComm: ibv_poll_cq failed on NIC %zu in worker\n", nic);
             return MPCOMM_ERR_TRANSFER;
         }
+        // One timestamp per CQ batch for the experimental limit trace.
+        NicLimitTraceBuffer* nic_trace = (n > 0 && trace && trace->nic == nic) ? trace : nullptr;
+        const int64_t batch_ns = nic_trace ? steadyNowNs() : 0;
         for (int i = 0; i < n; ++i) {
             size_t completed_nic = WrIdEncoding::decodeNic(wc_array[i].wr_id);
             size_t completed_qp = WrIdEncoding::decodeQp(wc_array[i].wr_id);
@@ -6176,6 +6348,11 @@ int MPComm::Impl::pollAllNicsForWorker(
                 if (completed_qp < qps_per_connection_) {
                     worker_nic_qp_completed[completed_nic][completed_qp]++;
                 }
+                // Experimental NIC limit: per-generation accounting (never underflows
+                // even if another worker's completion lands on this CQ poll).
+                uint32_t& tagged = limits.out_by_tag[completed_nic][WrIdEncoding::decodeTag(wc_array[i].wr_id)];
+                if (tagged > 0) --tagged;
+                advanceNicLimitDrain(limits, completed_nic, trace);
             }
 
             // Fast path: find target context in local active list (no lock needed)
@@ -6256,9 +6433,209 @@ int MPComm::Impl::pollAllNicsForWorker(
                     }
                 }
             }
+            if (nic_trace) {
+                const size_t chunk_idx = WrIdEncoding::decodeChunk(wc_array[i].wr_id);
+                if (chunk_idx < target_ctx->total_chunks.load(std::memory_order_relaxed)) {
+                    nic_trace->recordBytes(batch_ns, target_ctx->getChunk(chunk_idx).length);
+                }
+            }
             target_ctx->total_completed.fetch_add(1);
         }
     }
+    return MPCOMM_SUCCESS;
+}
+
+// ==================== Experimental per-NIC outstanding limit ====================
+
+void MPComm::Impl::resetNicLimits() {
+    for (auto& packed : nic_limit_packed_) {
+        packed.store(packNicLimit(0, MPCOMM_NIC_LIMIT_NONE), std::memory_order_relaxed);
+    }
+    nic_limit_version_.fetch_add(1, std::memory_order_release);
+}
+
+void MPComm::Impl::adoptNicLimits(size_t worker_id, WorkerLimitView& view, size_t num_nics,
+                                  const size_t (&posted)[kMaxNics],
+                                  const size_t (&completed)[kMaxNics]) {
+    WorkerLimitShared& shared = *worker_limit_shared_[worker_id];
+    // Publish counters BEFORE applied_generation (release), so a reader that sees a
+    // new applied generation also sees outstanding values at least this fresh.
+    for (size_t nic = 0; nic < num_nics; ++nic) {
+        shared.posted[nic].store(posted[nic], std::memory_order_relaxed);
+        shared.outstanding[nic].store(posted[nic] >= completed[nic] ? posted[nic] - completed[nic] : 0,
+                                      std::memory_order_relaxed);
+    }
+
+    const uint64_t version = nic_limit_version_.load(std::memory_order_acquire);
+    if (version == view.seen_version) return;
+    view.seen_version = version;
+
+    NicLimitTraceBuffer* trace = nic_limit_trace_.load(std::memory_order_acquire);
+    for (size_t nic = 0; nic < num_nics; ++nic) {
+        const uint64_t packed = nic_limit_packed_[nic].load(std::memory_order_acquire);
+        const uint32_t generation = static_cast<uint32_t>(packed >> 32);
+        if (generation == view.generation[nic]) continue;
+        if (view.out_by_tag[nic][generation & 0xFF] != 0) {
+            // Drain the old owner before reusing its tag; CQ polling must continue.
+            view.limit[nic] = 0;
+            view.seen_version = ~0ULL;
+            continue;
+        }
+
+        const uint32_t limit = static_cast<uint32_t>(packed);
+        const uint32_t previous = view.generation[nic];
+        view.limit[nic] = (limit == MPCOMM_NIC_LIMIT_NONE) ? SIZE_MAX : static_cast<size_t>(limit);
+        view.generation[nic] = generation;
+        view.live_gens[nic].push_back(generation);
+        if (trace && trace->nic == nic) {
+            trace->mark(previous, generation, steadyNowNs(), true);
+        }
+        advanceNicLimitDrain(view, nic, trace);
+        shared.applied_generation[nic].store(generation, std::memory_order_release);
+    }
+}
+
+void MPComm::Impl::advanceNicLimitDrain(WorkerLimitView& view, size_t nic,
+                                        NicLimitTraceBuffer* trace) {
+    auto& live = view.live_gens[nic];
+    if (live.size() < 2) return;
+    const uint32_t oldest = live.front();
+    // The newest (current) generation always stays; older ones leave once drained.
+    while (live.size() > 1 && view.out_by_tag[nic][live.front() & 0xFF] == 0) {
+        live.pop_front();
+    }
+    // Every generation <= new front now has no older WQE in flight on this worker.
+    if (trace && trace->nic == nic && live.front() != oldest) {
+        trace->mark(oldest, live.front(), steadyNowNs(), false);
+    }
+}
+
+int MPComm::Impl::setNicOutstandingLimit(size_t nic_index, uint32_t limit) {
+    const int64_t set_ns = steadyNowNs();
+    if (!initialized_) {
+        MPCOMM_LOG_ERROR("MPComm: setNicOutstandingLimit failed - not initialized\n");
+        return MPCOMM_ERR_CONTEXT;
+    }
+    if (nic_index >= nic_contexts_.size()) {
+        MPCOMM_LOG_ERROR("MPComm: setNicOutstandingLimit failed - NIC index %zu out of range\n",
+                         nic_index);
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(nic_limit_mutex_);
+    const uint32_t generation =
+        static_cast<uint32_t>(nic_limit_packed_[nic_index].load(std::memory_order_relaxed) >> 32) + 1;
+    NicLimitTraceBuffer* trace = nic_limit_trace_.load(std::memory_order_relaxed);
+    if (trace && trace->nic == nic_index) {
+        const uint32_t index = generation - trace->first_generation;
+        if (index < trace->max_events) {
+            auto& event = trace->events[index];
+            event.generation = generation;
+            event.limit = limit;
+            event.set_ns = set_ns;
+            trace->event_count.store(static_cast<size_t>(index) + 1, std::memory_order_release);
+        } else {
+            trace->dropped_events.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    nic_limit_packed_[nic_index].store(packNicLimit(generation, limit), std::memory_order_release);
+    nic_limit_version_.fetch_add(1, std::memory_order_release);
+    return MPCOMM_SUCCESS;
+}
+
+int MPComm::Impl::getNicLimitState(size_t nic_index, NicLimitState &out) const {
+    if (!initialized_ || worker_limit_shared_.empty()) return MPCOMM_ERR_CONTEXT;
+    if (nic_index >= nic_contexts_.size()) return MPCOMM_ERR_INVALID_ARG;
+
+    const uint64_t packed = nic_limit_packed_[nic_index].load(std::memory_order_acquire);
+    out.generation = static_cast<uint32_t>(packed >> 32);
+    out.limit = static_cast<uint32_t>(packed);
+    const uint64_t static_cap = static_cast<uint64_t>(max_outstanding_per_qp_) * qps_per_connection_;
+    out.effective_limit = static_cast<uint32_t>(
+        std::min<uint64_t>({static_cast<uint64_t>(out.limit), static_cap, 0xFFFFFFFFULL}));
+    out.all_workers_applied = true;
+    out.outstanding = 0;
+    out.worker_posted.clear();
+    for (const auto& worker : worker_limit_shared_) {
+        const uint32_t applied = worker->applied_generation[nic_index].load(std::memory_order_acquire);
+        if (static_cast<int32_t>(applied - out.generation) < 0) out.all_workers_applied = false;
+        out.outstanding += worker->outstanding[nic_index].load(std::memory_order_relaxed);
+        out.worker_posted.push_back(worker->posted[nic_index].load(std::memory_order_relaxed));
+    }
+    return MPCOMM_SUCCESS;
+}
+
+int MPComm::Impl::waitNicLimitApplied(size_t nic_index, int timeout_ms) {
+    const auto start = std::chrono::steady_clock::now();
+    NicLimitState state;
+    for (;;) {
+        const int rc = getNicLimitState(nic_index, state);
+        if (rc != MPCOMM_SUCCESS) return rc;
+        if (state.all_workers_applied && state.outstanding <= state.effective_limit) {
+            return MPCOMM_SUCCESS;
+        }
+        if (timeout_ms >= 0 &&
+            std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeout_ms)) {
+            return MPCOMM_ERR_TIMEOUT;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+}
+
+int MPComm::Impl::startNicLimitTrace(size_t nic_index, uint32_t bin_ns,
+                                     size_t max_bins, size_t max_events) {
+    if (!initialized_) return MPCOMM_ERR_CONTEXT;
+    if (nic_index >= nic_contexts_.size() || bin_ns < 1000 ||
+        max_bins == 0 || max_bins > (size_t{1} << 26) ||
+        max_events == 0 || max_events > (size_t{1} << 20)) {
+        MPCOMM_LOG_ERROR("MPComm: startNicLimitTrace - invalid arguments\n");
+        return MPCOMM_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(nic_limit_mutex_);
+    if (nic_limit_trace_.load(std::memory_order_relaxed)) {
+        MPCOMM_LOG_ERROR("MPComm: startNicLimitTrace - a trace is already active\n");
+        return MPCOMM_ERR_PENDING;
+    }
+    auto trace = std::make_unique<NicLimitTraceBuffer>();
+    trace->nic = nic_index;
+    trace->bin_ns = bin_ns;
+    trace->max_bins = max_bins;
+    trace->max_events = max_events;
+    trace->bins.reset(new std::atomic<uint64_t>[max_bins]());
+    trace->events.reset(new NicLimitTraceBuffer::Event[max_events]);
+    trace->first_generation =
+        static_cast<uint32_t>(nic_limit_packed_[nic_index].load(std::memory_order_relaxed) >> 32) + 1;
+    trace->origin_ns = steadyNowNs();
+    nic_limit_trace_.store(trace.get(), std::memory_order_release);
+    nic_limit_traces_.push_back(std::move(trace));
+    return MPCOMM_SUCCESS;
+}
+
+int MPComm::Impl::stopNicLimitTrace(NicLimitTrace &out) {
+    std::lock_guard<std::mutex> lock(nic_limit_mutex_);
+    NicLimitTraceBuffer* trace = nic_limit_trace_.load(std::memory_order_relaxed);
+    if (!trace) return MPCOMM_ERR_CONTEXT;
+    nic_limit_trace_.store(nullptr, std::memory_order_release);
+
+    out.nic_index = trace->nic;
+    out.origin_ns = trace->origin_ns;
+    out.bin_ns = trace->bin_ns;
+    size_t used = trace->max_bins;
+    while (used > 0 && trace->bins[used - 1].load(std::memory_order_relaxed) == 0) --used;
+    out.completed_bytes.resize(used);
+    for (size_t i = 0; i < used; ++i) {
+        out.completed_bytes[i] = trace->bins[i].load(std::memory_order_relaxed);
+    }
+    const size_t count = trace->event_count.load(std::memory_order_acquire);
+    out.events.clear();
+    out.events.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto& event = trace->events[i];
+        out.events.push_back({event.generation, event.limit, event.set_ns,
+                              event.applied_ns.load(std::memory_order_relaxed),
+                              event.drained_ns.load(std::memory_order_relaxed)});
+    }
+    out.dropped_events = trace->dropped_events.load(std::memory_order_relaxed);
+    out.dropped_completions = trace->dropped_completions.load(std::memory_order_relaxed);
     return MPCOMM_SUCCESS;
 }
 
@@ -6564,6 +6941,30 @@ TransferResult MPComm::getTransferResult(TransferHandle handle) {
 
 void MPComm::releaseTransfer(TransferHandle handle) {
     impl_->releaseTransfer(handle);
+}
+
+int MPComm::setNicOutstandingLimit(size_t nic_index, uint32_t limit) {
+    return impl_->setNicOutstandingLimit(nic_index, limit);
+}
+
+int MPComm::clearNicOutstandingLimit(size_t nic_index) {
+    return impl_->setNicOutstandingLimit(nic_index, MPCOMM_NIC_LIMIT_NONE);
+}
+
+int MPComm::getNicLimitState(size_t nic_index, NicLimitState &out) const {
+    return impl_->getNicLimitState(nic_index, out);
+}
+
+int MPComm::waitNicLimitApplied(size_t nic_index, int timeout_ms) {
+    return impl_->waitNicLimitApplied(nic_index, timeout_ms);
+}
+
+int MPComm::startNicLimitTrace(size_t nic_index, uint32_t bin_ns, size_t max_bins, size_t max_events) {
+    return impl_->startNicLimitTrace(nic_index, bin_ns, max_bins, max_events);
+}
+
+int MPComm::stopNicLimitTrace(NicLimitTrace &out) {
+    return impl_->stopNicLimitTrace(out);
 }
 
 size_t MPComm::getNumNics() const {

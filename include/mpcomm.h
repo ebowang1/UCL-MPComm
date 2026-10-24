@@ -129,6 +129,43 @@ struct TransferResult {
 };
 
 // =====================================================================
+// Experimental: per-NIC dynamic outstanding-WQE limit (QoS testing)
+// =====================================================================
+
+// Limit value meaning "no additional limit" (only the static flow control applies).
+static constexpr uint32_t MPCOMM_NIC_LIMIT_NONE = 0xFFFFFFFFu;
+
+// Snapshot of one NIC's dynamic limit as seen by the worker threads.
+struct NicLimitState {
+    uint32_t limit;                       // configured limit, MPCOMM_NIC_LIMIT_NONE if unlimited
+    uint32_t effective_limit;             // min(limit, MAX_OUTSTANDING_PER_QP * QPS_PER_CONNECTION)
+    uint32_t generation;                  // incremented by every set/clear on this NIC
+    bool all_workers_applied;             // every worker adopted this generation
+    uint64_t outstanding;                 // posted, not yet completed WQEs on this NIC (all workers)
+    std::vector<uint64_t> worker_posted;  // lifetime WQEs posted on this NIC, per worker
+};
+
+// One limit change recorded while a trace is active (steady_clock nanoseconds).
+struct NicLimitEvent {
+    uint32_t generation;
+    uint32_t limit;      // new limit (MPCOMM_NIC_LIMIT_NONE = cleared)
+    int64_t set_ns;      // set call entered
+    int64_t applied_ns;  // last worker adopted the change (0 = not observed)
+    int64_t drained_ns;  // every WQE posted under an older generation completed (0 = not observed)
+};
+
+// Completed-byte histogram and limit events of one NIC.
+struct NicLimitTrace {
+    size_t nic_index;
+    int64_t origin_ns;                      // start of bin 0 (steady_clock nanoseconds)
+    uint32_t bin_ns;
+    std::vector<uint64_t> completed_bytes;  // successfully completed bytes per bin
+    std::vector<NicLimitEvent> events;
+    uint64_t dropped_events;                // limit changes beyond max_events
+    uint64_t dropped_completions;           // completions beyond the last bin
+};
+
+// =====================================================================
 // MPComm Class (Pimpl)
 // =====================================================================
 
@@ -379,6 +416,44 @@ class MPComm {
     void releaseTransfer(TransferHandle handle);
 
     // ==================== End Async Transfer API ====================
+
+    // ==================== Experimental: NIC outstanding limit ====================
+    //
+    // Caps the WQEs that EACH worker thread may keep outstanding on one local NIC,
+    // summed across requests, connections and QPs, on top of the static
+    // MPCOMM_MAX_OUTSTANDING_PER_QP flow control. limit = 0 pauses new posting on
+    // that NIC; posted WQEs are never recalled and completions keep being polled.
+    // Workers adopt a change at the start of their next loop iteration.
+    // Correct only while a single worker posts on the NIC (keep every local buffer
+    // that uses the NIC on the NIC's NUMA node; check NicLimitState::worker_posted).
+    // Must not race with init()/shutdown().
+
+    /** Set the limit (MPCOMM_NIC_LIMIT_NONE clears it). */
+    int setNicOutstandingLimit(size_t nic_index, uint32_t limit);
+
+    /** Remove the additional limit. */
+    int clearNicOutstandingLimit(size_t nic_index);
+
+    /** Read the current limit, worker adoption and outstanding WQEs. */
+    int getNicLimitState(size_t nic_index, NicLimitState &out) const;
+
+    /**
+     * Wait until every worker adopted the current limit and the NIC's outstanding
+     * WQEs are within it. Waits only for posted WQEs, never for pending requests.
+     * @param timeout_ms  -1 = wait forever; timeout cancels nothing
+     */
+    int waitNicLimitApplied(size_t nic_index, int timeout_ms = -1);
+
+    /**
+     * Start recording limit events and completed bytes per time bin for one NIC.
+     * Only one trace may be active per instance.
+     */
+    int startNicLimitTrace(size_t nic_index, uint32_t bin_ns, size_t max_bins, size_t max_events);
+
+    /** Stop the active trace and return its contents. */
+    int stopNicLimitTrace(NicLimitTrace &out);
+
+    // ==================== End Experimental NIC outstanding limit ====================
 
     /** Get number of available NICs */
     size_t getNumNics() const;

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
@@ -131,6 +132,34 @@ bool validNicName(const std::string& name) {
     });
 }
 
+int64_t millisNs(const std::string& value, const std::string& flag) {
+    char* end = nullptr;
+    errno = 0;
+    const double ms = std::strtod(value.c_str(), &end);
+    if (value.empty() || end != value.c_str() + value.size() || errno || !std::isfinite(ms) ||
+        ms <= 0 || ms > 60000.0)
+        fail(flag + " must be milliseconds in (0,60000]");
+    const int64_t ns = static_cast<int64_t>(std::llround(ms * 1e6));
+    if (ns < 1000) fail(flag + " must be at least 1 microsecond");
+    return ns;
+}
+
+// Comma-separated outstanding-WQE limits, e.g. "1,4,16,64".
+std::vector<uint32_t> parseOqList(const std::string& text) {
+    std::vector<uint32_t> values;
+    size_t begin = 0;
+    for (;;) {
+        const size_t end = text.find(',', begin);
+        const std::string item = text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        const uint64_t value = unsignedNumber(item, "--oq-list");
+        if (value == 0 || value >= mpcomm::MPCOMM_NIC_LIMIT_NONE) fail("--oq-list values must be positive");
+        values.push_back(static_cast<uint32_t>(value));
+        if (values.size() > 64) fail("--oq-list supports at most 64 values");
+        if (end == std::string::npos) return values;
+        begin = end + 1;
+    }
+}
+
 // One READ stream of the single receiver process: GPU label, local NIC and source data port.
 struct StreamSpec {
     int gpu = 0;
@@ -172,13 +201,23 @@ struct Options {
     bool read_rounds = false;
     size_t total = 0;
     std::vector<StreamSpec> streams;
+    // READ receiver test mode: rounds (synchronized rounds), sweep (OQ -> bandwidth),
+    // switch (limit switching cost). sweep/switch read total_bytes split across GPUs.
+    std::string mode = "rounds";
+    uint64_t total_bytes = 0;
+    std::vector<uint32_t> oq_list;
+    unsigned repeat = 3, switches = 100;
+    uint32_t high_oq = 64, low_oq = 1, bin_ns = 100000;
+    int64_t high_ns = 2000000, low_ns = 2000000;
 
     static Options parse(int argc, char** argv) {
         const std::vector<std::string> allowed = {
             "--role", "--memory", "--op", "--nic", "--gpu", "--numa", "--listen-port",
             "--peer-ip", "--peer-port", "--stream", "--size", "--depth", "--warmup",
             "--duration", "--interval", "--timeout-ms", "--qps", "--chunk", "--outstanding",
-            "--verify", "--setup-timeout", "--read-rounds", "--streams"};
+            "--verify", "--setup-timeout", "--read-rounds", "--streams", "--mode", "--total-bytes",
+            "--oq-list", "--repeat", "--high-oq", "--low-oq", "--high-ms", "--low-ms",
+            "--switches", "--bin-us"};
         std::unordered_map<std::string, std::string> args;
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
@@ -273,7 +312,65 @@ struct Options {
         if (o.depth > std::numeric_limits<size_t>::max() / o.size)
             fail("--size * --depth overflows size_t");
         o.total = o.size * o.depth;
+        o.parseLimitMode(args);
         return o;
+    }
+
+    // Shares of total_bytes per stream (sweep/switch): remainder bytes go to the first streams.
+    std::vector<size_t> shares() const {
+        std::vector<size_t> result(streams.size(), size);
+        if (mode == "rounds") return result;
+        const uint64_t base = total_bytes / streams.size(), remainder = total_bytes % streams.size();
+        for (size_t i = 0; i < result.size(); ++i) result[i] = static_cast<size_t>(base + (i < remainder ? 1 : 0));
+        return result;
+    }
+
+    void parseLimitMode(const std::unordered_map<std::string, std::string>& args) {
+        auto has = [&](const char* key) { return args.count(key) != 0; };
+        auto get = [&](const char* key, const std::string& fallback) {
+            auto it = args.find(key);
+            return it == args.end() ? fallback : it->second;
+        };
+        mode = get("--mode", "rounds");
+        if (mode != "rounds" && mode != "sweep" && mode != "switch") fail("--mode must be rounds, sweep or switch");
+        if (mode == "rounds") {
+            for (const char* key : {"--total-bytes", "--oq-list", "--repeat", "--high-oq", "--low-oq",
+                                    "--high-ms", "--low-ms", "--switches", "--bin-us"})
+                if (has(key)) fail(std::string(key) + " is only valid with --mode sweep or switch");
+            return;
+        }
+        if (streams.empty()) fail("--mode sweep/switch requires the CPU READ receiver (--streams)");
+        for (const auto& spec : streams)
+            if (spec.nic != streams[0].nic) fail("--mode sweep/switch requires exactly one A NIC for all streams");
+        if (!has("--total-bytes")) fail("--mode sweep/switch requires --total-bytes");
+        total_bytes = unsignedNumber(get("--total-bytes", ""), "--total-bytes");
+        if (total_bytes < streams.size()) fail("--total-bytes must give every GPU stream at least one byte");
+        const uint64_t cap = static_cast<uint64_t>(qps) * outstanding;
+        oq_list = parseOqList(get("--oq-list", "1,4,16,64"));
+        for (uint32_t oq : oq_list)
+            if (oq > (mode == "sweep" ? cap : 256))
+                fail("--oq-list values must not exceed --qps * --outstanding (" + std::to_string(cap) + ")");
+        const uint64_t rep = unsignedNumber(get("--repeat", "3"), "--repeat");
+        if (rep < 1 || rep > 100) fail("--repeat must be in [1,100]");
+        repeat = static_cast<unsigned>(rep);
+        const uint64_t high = unsignedNumber(get("--high-oq", "64"), "--high-oq");
+        const uint64_t low = unsignedNumber(get("--low-oq", "1"), "--low-oq");
+        if (high < 1 || high > (mode == "switch" ? cap : 256))
+            fail("--high-oq must be in [1, --qps * --outstanding = " + std::to_string(cap) + "]");
+        if (low >= high) fail("--low-oq must be smaller than --high-oq (0 pauses posting)");
+        high_oq = static_cast<uint32_t>(high);
+        low_oq = static_cast<uint32_t>(low);
+        high_ns = millisNs(get("--high-ms", "2"), "--high-ms");
+        low_ns = millisNs(get("--low-ms", "2"), "--low-ms");
+        const uint64_t count = unsignedNumber(get("--switches", "100"), "--switches");
+        if (count < 1 || count > 100000) fail("--switches must be in [1,100000]");
+        switches = static_cast<unsigned>(count);
+        const uint64_t bin_us = unsignedNumber(get("--bin-us", "100"), "--bin-us");
+        if (bin_us < 1 || bin_us > 10000) fail("--bin-us must be in [1,10000]");
+        bin_ns = static_cast<uint32_t>(bin_us * 1000);
+        for (size_t share : shares())
+            if ((share + chunk - 1) / chunk > std::numeric_limits<uint32_t>::max())
+                fail("a GPU share needs more than 2^32 chunks; increase --chunk");
     }
 
     uint8_t pattern() const { return static_cast<uint8_t>(stream % 251 + 1); }
@@ -408,6 +505,12 @@ public:
                      ", expected " + std::to_string(o.pattern()) +
                      ", got " + std::to_string(bytes[i]));
         }
+    }
+
+    // Zero a CPU receive buffer so a later verify() proves fresh READ data arrived.
+    void clear(const Options& o) {
+        if (!cpu_) fail("clearing requires CPU memory");
+        std::memset(cpu_, 0, o.total);
     }
 
 private:
@@ -786,6 +889,86 @@ private:
     uint64_t sample_window_ = 0;
 };
 
+// Toggles NIC 0's outstanding limit between --high-oq and --low-oq from a dedicated
+// thread, so the switch instants are not disturbed by controller IPC. The schedule
+// starts at high, ends with a final high phase and then clears the limit.
+class LimitToggler {
+public:
+    LimitToggler(mpcomm::MPComm& comm, const Options& options) : comm_(comm), options_(options) {
+        thread_ = std::thread([this] { run(); });
+    }
+
+    ~LimitToggler() {
+        stop_.store(true, std::memory_order_relaxed);
+        if (thread_.joinable()) thread_.join();
+    }
+
+    LimitToggler(const LimitToggler&) = delete;
+    LimitToggler& operator=(const LimitToggler&) = delete;
+
+    bool done() const { return done_.load(std::memory_order_acquire); }
+
+    // Join and rethrow a failure of the toggling thread.
+    void finish() {
+        if (thread_.joinable()) thread_.join();
+        if (!error_.empty()) fail("limit toggling failed: " + error_);
+    }
+
+private:
+    void set(uint32_t limit) { checkComm(comm_.setNicOutstandingLimit(0, limit), "setNicOutstandingLimit"); }
+
+    bool sleepUntil(Clock::time_point when) {
+        std::this_thread::sleep_until(when);
+        return !stop_.load(std::memory_order_relaxed);
+    }
+
+    void run() noexcept {
+        try {
+            auto next = Clock::now();
+            set(options_.high_oq);
+            unsigned down = 0, up = 0;
+            while (down < options_.switches || up < options_.switches) {
+                next += std::chrono::nanoseconds(options_.high_ns);
+                if (!sleepUntil(next)) break;
+                set(options_.low_oq);
+                ++down;
+                next += std::chrono::nanoseconds(options_.low_ns);
+                if (!sleepUntil(next)) break;
+                set(options_.high_oq);
+                ++up;
+            }
+            // Keep the last recovery a full high phase before clearing.
+            sleepUntil(next + std::chrono::nanoseconds(options_.high_ns));
+        } catch (const std::exception& error) {
+            error_ = error.what();
+        }
+        comm_.clearNicOutstandingLimit(0);
+        done_.store(true, std::memory_order_release);
+    }
+
+    mpcomm::MPComm& comm_;
+    const Options& options_;
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> done_{false};
+    std::string error_;
+    std::thread thread_;
+};
+
+template <typename T, typename Write>
+void emitChunks(const char* event, const char* field, const std::vector<T>& items, size_t per_line, Write write) {
+    for (size_t offset = 0; offset < items.size(); offset += per_line) {
+        std::ostringstream out;
+        out << "{\"event\":\"" << event << "\",\"offset\":" << offset << ",\"" << field << "\":[";
+        const size_t end = std::min(items.size(), offset + per_line);
+        for (size_t i = offset; i < end; ++i) {
+            if (i > offset) out << ',';
+            write(out, items[i]);
+        }
+        out << "]}";
+        emit(out.str());
+    }
+}
+
 // CPU READ receiver: ONE process for all GPU streams, with one MPComm instance per
 // local NIC (normally exactly one). Streams that share a NIC therefore share that
 // instance's connection set, NUMA worker and outstanding window, as in a Decode node
@@ -817,26 +1000,34 @@ public:
             if (nodes_[i] < 0)
                 fail("NIC " + nics_[i] + " NUMA node is unknown; explicitly pass --numa N instead of auto");
         }
-        for (const auto& spec : options_.streams) {
+        const std::vector<size_t> shares = options_.shares();
+        for (size_t i = 0; i < options_.streams.size(); ++i) {
+            const auto& spec = options_.streams[i];
             auto stream = std::make_unique<Stream>();
             stream->options = options_;
             stream->options.stream = spec.gpu;
             stream->options.nic = spec.nic;
             stream->options.peer_port = spec.port;
+            // Each stream reads exactly its share: one request of `size` bytes.
+            stream->options.size = shares[i];
+            stream->options.depth = 1;
+            stream->options.total = shares[i];
             stream->comm_index = static_cast<size_t>(
                 std::find(nics_.begin(), nics_.end(), spec.nic) - nics_.begin());
             // Distinct logical IDs: every source GPU process is a separate connection.
             stream->host = std::string(kServerHost) + "-gpu" + std::to_string(spec.gpu);
             stream->memory.allocate(stream->options, nodes_[stream->comm_index]);
-            if (stream->memory.address() > std::numeric_limits<uintptr_t>::max() - options_.total)
+            if (stream->memory.address() > std::numeric_limits<uintptr_t>::max() - stream->options.total)
                 fail("local buffer address range overflows uintptr_t");
             checkComm(comm(*stream).registerMemory(reinterpret_cast<void*>(stream->memory.address()),
-                                                    options_.total), "registerMemory");
+                                                    stream->options.total), "registerMemory");
             streams_.push_back(std::move(stream));
         }
         for (auto& stream : streams_) connect(*stream);
         ready();
-        runRounds();
+        if (options_.mode == "sweep") runSweep();
+        else if (options_.mode == "switch") runSwitch();
+        else runRounds();
     }
 
 private:
@@ -872,9 +1063,9 @@ private:
         checkComm(c.connect(stream.host, options_.peer_ip, port), "connect");
         checkComm(c.queryRemoteBufferByNuma(stream.host, options_.peer_ip, port, -1, stream.remote),
                   "queryRemoteBufferByNuma");
-        if (stream.remote.length < options_.total || stream.remote.rkeys.size() != 1 || stream.remote.rkeys[0] == 0)
+        if (stream.remote.length < stream.options.total || stream.remote.rkeys.size() != 1 || stream.remote.rkeys[0] == 0)
             fail(label(stream) + ": remote buffer is too small or does not advertise exactly one valid rkey");
-        if (stream.remote.addr > std::numeric_limits<uintptr_t>::max() - options_.total)
+        if (stream.remote.addr > std::numeric_limits<uintptr_t>::max() - stream.options.total)
             fail(label(stream) + ": remote buffer address range overflows uintptr_t");
         checkComm(c.updateRemoteMemoryInfo(stream.host, stream.remote.rkeys), "updateRemoteMemoryInfo");
     }
@@ -882,6 +1073,7 @@ private:
     void ready() {
         std::ostringstream out;
         out << "{\"event\":\"ready\",\"role\":\"client\",\"op\":\"read\",\"memory\":\"cpu\""
+            << ",\"mode\":" << jsonString(options_.mode)
             << ",\"processes\":1,\"instances\":" << comms_.size() << ",\"size\":" << options_.size
             << ",\"qps\":" << options_.qps << ",\"chunk\":" << options_.chunk
             << ",\"outstanding\":" << options_.outstanding << ",\"clock_ns\":" << nowNs() << ",\"streams\":[";
@@ -890,7 +1082,7 @@ private:
             if (i) out << ',';
             out << "{\"stream\":" << s.options.stream << ",\"nic\":" << jsonString(s.options.nic)
                 << ",\"numa\":" << nodes_[s.comm_index] << ",\"pattern\":" << unsigned(s.options.pattern())
-                << ",\"allocated_bytes\":" << options_.total << '}';
+                << ",\"bytes\":" << s.options.size << ",\"allocated_bytes\":" << s.options.total << '}';
         }
         out << "]}";
         emit(out.str());
@@ -903,7 +1095,7 @@ private:
         if (stream.slot.handle != mpcomm::INVALID_TRANSFER_HANDLE) fail(label(stream) + ": READ slot is still active");
         stream.slot.submitted_ns = nowNs();
         stream.slot.handle = comm(stream).getAsync(stream.memory.address(), stream.host,
-                                                   stream.remote.addr, options_.size);
+                                                   stream.remote.addr, stream.options.size);
         if (stream.slot.handle == mpcomm::INVALID_TRANSFER_HANDLE) fail(label(stream) + ": READ submission failed");
     }
 
@@ -915,10 +1107,10 @@ private:
         if (!c.isTransferComplete(slot.handle)) return false;
         slot.completed_ns = nowNs();
         auto result = c.getTransferResult(slot.handle);
-        if (result.error_code != mpcomm::MPCOMM_SUCCESS || result.bytes_transferred != options_.size)
+        if (result.error_code != mpcomm::MPCOMM_SUCCESS || result.bytes_transferred != stream.options.size)
             fail(label(stream) + ": READ result error=" + std::to_string(result.error_code) +
                  ", bytes=" + std::to_string(result.bytes_transferred) +
-                 ", expected=" + std::to_string(options_.size));
+                 ", expected=" + std::to_string(stream.options.size));
         c.releaseTransfer(slot.handle);
         slot.handle = mpcomm::INVALID_TRANSFER_HANDLE;
         slot.received = true;
@@ -946,7 +1138,7 @@ private:
             const Stream& s = *streams_[i];
             if (i) out << ',';
             out << "{\"stream\":" << s.options.stream << ",\"submitted_ns\":" << s.slot.submitted_ns
-                << ",\"completed_ns\":" << s.slot.completed_ns << ",\"bytes\":" << options_.size
+                << ",\"completed_ns\":" << s.slot.completed_ns << ",\"bytes\":" << s.options.size
                 << ",\"errors\":0}";
         }
         out << "]}";
@@ -1027,6 +1219,157 @@ private:
                 fail("unexpected READ rounds command: " + command);
             }
         }
+    }
+
+    // ---- sweep / switch: whole total_bytes read once per measurement ----
+
+    struct TransferTiming {
+        int64_t submitted_ns = 0;  // common submit instant (before the first getAsync)
+        int64_t completed_ns = 0;  // last stream observed complete
+    };
+
+    // Submit one getAsync per stream (its whole share) at once and wait for all of them.
+    TransferTiming transferOnce() {
+        controller_.checkSoon();
+        TransferTiming timing;
+        timing.submitted_ns = nowNs();
+        for (auto& stream : streams_) submit(*stream);
+        size_t pending = streams_.size();
+        while (pending) {
+            controller_.check();
+            bool progress = false;
+            for (auto& stream : streams_) {
+                if (complete(*stream)) {
+                    --pending;
+                    progress = true;
+                }
+            }
+            if (pending && !progress) std::this_thread::yield();
+        }
+        for (const auto& stream : streams_)
+            timing.completed_ns = std::max(timing.completed_ns, stream->slot.completed_ns);
+        return timing;
+    }
+
+    int limitTimeoutMs() const {
+        return static_cast<int>(std::min<int64_t>(options_.timeout_ns / 1000000, std::numeric_limits<int>::max()));
+    }
+
+    void applyLimit(mpcomm::MPComm& instance, uint32_t limit) {
+        checkComm(instance.setNicOutstandingLimit(0, limit), "setNicOutstandingLimit");
+        checkComm(instance.waitNicLimitApplied(0, limitTimeoutMs()), "waitNicLimitApplied");
+    }
+
+    // The OQ limit is enforced per worker thread: results are only valid if one worker posted.
+    unsigned postingWorkers(mpcomm::MPComm& instance) {
+        mpcomm::NicLimitState state{};
+        checkComm(instance.getNicLimitState(0, state), "getNicLimitState");
+        unsigned count = 0;
+        for (uint64_t posted : state.worker_posted)
+            if (posted) ++count;
+        if (count != 1)
+            fail(std::to_string(count) + " MPComm workers posted on the NIC; the OQ limit is per worker, so "
+                 "results are invalid. Keep every receive buffer on the NIC NUMA node (--numa auto).");
+        return count;
+    }
+
+    void clearBuffers() {
+        if (options_.verify != "full") return;
+        for (auto& stream : streams_) stream->memory.clear(stream->options);
+    }
+
+    void emitWarmup(const TransferTiming& timing) {
+        emit("{\"event\":\"warmup_done\",\"latency_ns\":" +
+             std::to_string(timing.completed_ns - timing.submitted_ns) + "}");
+    }
+
+    void emitSweepResult(uint32_t oq, unsigned repeat, const TransferTiming& timing) {
+        std::ostringstream out;
+        out << "{\"event\":\"sweep_result\",\"oq\":" << oq << ",\"repeat\":" << repeat
+            << ",\"submitted_ns\":" << timing.submitted_ns << ",\"completed_ns\":" << timing.completed_ns
+            << ",\"latency_ns\":" << (timing.completed_ns - timing.submitted_ns) << ",\"streams\":[";
+        for (size_t i = 0; i < streams_.size(); ++i) {
+            const Stream& s = *streams_[i];
+            if (i) out << ',';
+            out << "{\"stream\":" << s.options.stream << ",\"bytes\":" << s.options.size
+                << ",\"completed_ns\":" << s.slot.completed_ns << '}';
+        }
+        out << "]}";
+        emit(out.str());
+    }
+
+    // Test 1: for every OQ, repeat: set limit, wait until applied, read total_bytes once.
+    void runSweep() {
+        if (waitCommand() != "start") fail("sweep expected stdin command: start");
+        auto& instance = *comms_[0];
+        checkComm(instance.clearNicOutstandingLimit(0), "clearNicOutstandingLimit");
+        emitWarmup(transferOnce());
+        const size_t runs = options_.oq_list.size() * options_.repeat;
+        size_t run = 0;
+        for (uint32_t oq : options_.oq_list) {
+            for (unsigned repeat = 1; repeat <= options_.repeat; ++repeat) {
+                if (++run == runs) clearBuffers();  // the last run must rewrite every verified byte
+                applyLimit(instance, oq);
+                emitSweepResult(oq, repeat, transferOnce());
+            }
+        }
+        checkComm(instance.clearNicOutstandingLimit(0), "clearNicOutstandingLimit");
+        const unsigned posting = postingWorkers(instance);
+        verify();
+        shutdown();
+        emit("{\"event\":\"sweep_done\",\"runs\":" + std::to_string(runs) + ",\"posting_workers\":" +
+             std::to_string(posting) + ",\"verified\":" + (options_.verify == "full" ? "true" : "null") + "}");
+    }
+
+    // Test 2: toggle the limit between high and low while reading total_bytes repeatedly,
+    // and export the limit events, completed bytes per bin and transfer boundaries.
+    void runSwitch() {
+        if (waitCommand() != "start") fail("switch expected stdin command: start");
+        auto& instance = *comms_[0];
+        checkComm(instance.clearNicOutstandingLimit(0), "clearNicOutstandingLimit");
+        emitWarmup(transferOnce());
+        clearBuffers();
+        const int64_t planned = static_cast<int64_t>(options_.switches) * (options_.high_ns + options_.low_ns) +
+                                options_.high_ns;
+        const int64_t span = planned + options_.timeout_ns + 10 * kNsPerSecond;
+        const int64_t needed_bins = span / options_.bin_ns + 1;
+        if (needed_bins > (int64_t{1} << 26))
+            fail("switch trace exceeds capacity; increase --bin-us or reduce --switches/phase durations");
+        const size_t max_bins = static_cast<size_t>(needed_bins);
+        const size_t max_events = 2 * static_cast<size_t>(options_.switches) + 16;
+        checkComm(instance.startNicLimitTrace(0, options_.bin_ns, max_bins, max_events), "startNicLimitTrace");
+        std::vector<TransferTiming> transfers;
+        {
+            LimitToggler toggler(instance, options_);
+            do {
+                transfers.push_back(transferOnce());
+            } while (!toggler.done());
+            toggler.finish();
+        }
+        mpcomm::NicLimitTrace trace;
+        checkComm(instance.stopNicLimitTrace(trace), "stopNicLimitTrace");
+        const unsigned posting = postingWorkers(instance);
+
+        std::ostringstream meta;
+        meta << "{\"event\":\"trace_meta\",\"origin_ns\":" << trace.origin_ns << ",\"bin_ns\":" << trace.bin_ns
+             << ",\"bins\":" << trace.completed_bytes.size() << ",\"events\":" << trace.events.size()
+             << ",\"transfers\":" << transfers.size() << ",\"dropped_events\":" << trace.dropped_events
+             << ",\"dropped_completions\":" << trace.dropped_completions << '}';
+        emit(meta.str());
+        emitChunks("trace_transfers", "transfers", transfers, 512, [](std::ostream& out, const TransferTiming& t) {
+            out << '[' << t.submitted_ns << ',' << t.completed_ns << ']';
+        });
+        emitChunks("trace_events", "events", trace.events, 512, [](std::ostream& out, const mpcomm::NicLimitEvent& e) {
+            out << '[' << e.generation << ',' << e.limit << ',' << e.set_ns << ',' << e.applied_ns << ','
+                << e.drained_ns << ']';
+        });
+        emitChunks("trace_bins", "bytes", trace.completed_bytes, 4096, [](std::ostream& out, uint64_t bytes) {
+            out << bytes;
+        });
+        verify();
+        shutdown();
+        emit("{\"event\":\"switch_done\",\"posting_workers\":" + std::to_string(posting) +
+             ",\"verified\":" + (options_.verify == "full" ? "true" : "null") + "}");
     }
 
     Options options_;

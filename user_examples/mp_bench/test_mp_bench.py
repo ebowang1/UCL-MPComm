@@ -21,49 +21,16 @@ class FakeWorker:
 
     def __init__(self, args, stream, config, server, gpu_memory, peer_ip=None, peer_port=None):
         self.stream = stream["gpu"]
+        self.label = f"GPU {self.stream}"
         self.config = config
         self.server = server
         self.events = queue.Queue()
         self.closed = False
-        self.measuring = False
-        self.measured_operations = 0
-        self.round_id = 0
         self.records.append((args.role, server, gpu_memory, self.stream))
         self.events.put({"event": "ready", "stream": self.stream,
                          "port": stream.get("port", peer_port)})
 
     def command(self, text):
-        if self.config["op"] == "read" and not self.server:
-            if text == "start":
-                self.events.put({"event": "rounds_ready", "stream": self.stream})
-            elif text.startswith("round "):
-                round_id = int(text.split()[1])
-                if round_id != self.round_id + 1:
-                    raise ValueError("nonsequential simulated READ round")
-                self.round_id = round_id
-                submitted = time.monotonic_ns()
-                completed = time.monotonic_ns()
-                while completed <= submitted:
-                    completed = time.monotonic_ns()
-                self.events.put({"event": "round_done", "round": round_id, "stream": self.stream,
-                                 "submitted_ns": submitted, "completed_ns": completed,
-                                 "bytes": self.config["size"], "errors": 0})
-                if self.measuring:
-                    self.measured_operations += 1
-            elif text == "warmup_done":
-                self.events.put({"event": "warmup_ready", "stream": self.stream})
-            elif text.startswith("measure "):
-                self.measuring = True
-                self.events.put({"event": "measurement_ready", "stream": self.stream})
-            elif text == "finish":
-                self.events.put({"event": "result", "stream": self.stream,
-                                 "bytes": self.measured_operations * self.config["size"],
-                                 "operations": self.measured_operations, "errors": 0,
-                                 "elapsed_ns": int(self.config["duration"] * 1e9),
-                                 "read_rounds": True, "verified": True})
-            else:
-                raise ValueError(text)
-            return
         if text == "start":
             self.events.put({"event": "warmup_ready", "stream": self.stream})
         elif text.startswith("measure "):
@@ -76,6 +43,73 @@ class FakeWorker:
                              "drain_bytes": 123, "verified": True})
         elif text == "stop":
             self.events.put({"event": "result", "stream": self.stream, "verified": True})
+        else:
+            raise ValueError(text)
+
+    def event(self):
+        try:
+            return self.events.get_nowait()
+        except queue.Empty:
+            return None
+
+    def successful_exit(self, timeout=15):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class FakeReadClient:
+    """Simulates the single A READ process serving every GPU stream."""
+    instances = []
+
+    def __init__(self, args, config, peer_ip, ports):
+        self.label = "A READ receiver"
+        self.config = config
+        self.gpus = [s["gpu"] for s in config["streams"]]
+        self.ports = list(ports)
+        self.events = queue.Queue()
+        self.closed = False
+        self.measuring = False
+        self.measured_rounds = 0
+        self.round_id = 0
+        self.instances.append(self)
+        self.events.put({"event": "ready", "instances": 1,
+                         "streams": [{"stream": g, "numa": 0} for g in self.gpus]})
+
+    def round_streams(self):
+        items = []
+        for gpu in self.gpus:
+            submitted = time.monotonic_ns()
+            completed = time.monotonic_ns()
+            while completed <= submitted:
+                completed = time.monotonic_ns()
+            items.append({"stream": gpu, "submitted_ns": submitted, "completed_ns": completed,
+                          "bytes": self.config["size"], "errors": 0})
+        return items
+
+    def command(self, text):
+        if text == "start":
+            self.events.put({"event": "rounds_ready"})
+        elif text.startswith("round "):
+            round_id = int(text.split()[1])
+            if round_id != self.round_id + 1:
+                raise ValueError("nonsequential simulated READ round")
+            self.round_id = round_id
+            self.events.put({"event": "round_done", "round": round_id, "streams": self.round_streams()})
+            if self.measuring:
+                self.measured_rounds += 1
+        elif text == "warmup_done":
+            self.events.put({"event": "warmup_ready"})
+        elif text.startswith("measure "):
+            self.measuring = True
+            self.events.put({"event": "measurement_ready"})
+        elif text == "finish":
+            ops = self.measured_rounds
+            self.events.put({"event": "result", "rounds": ops, "results": [
+                {"stream": g, "bytes": ops * self.config["size"], "operations": ops, "errors": 0,
+                 "elapsed_ns": int(self.config["duration"] * 1e9), "read_rounds": True,
+                 "verified": True} for g in self.gpus]})
         else:
             raise ValueError(text)
 
@@ -121,32 +155,58 @@ class ControllerTests(unittest.TestCase):
             bench.gpu_arg("0,00")
 
     def test_native_setup_timeout_is_forwarded(self):
-        for operation in ("read", "write"):
-            for server in (True, False):
-                for timeout in (120, 300):
-                    gpu_memory = server if operation == "read" else not server
-                    role = "source" if gpu_memory else "receiver"
-                    argv = ["--role", role, "--setup-timeout", str(timeout)]
-                    if role == "receiver":
-                        argv += ["--peer", "127.0.0.1", "--nics", "mlx5_0"]
-                    args = bench.parse_args(argv)
-                    stream = {"gpu": 0, "gpu_nic": "mlx5_7", "cpu_nic": "mlx5_0", "port": 18516}
-                    config = {"op": operation, "numa": "auto", "size": 4096, "depth": 4,
-                              "warmup": 5, "duration": 60, "interval": 1, "timeout_ms": 30000,
-                              "qps": 4, "chunk": 65536, "outstanding": 8, "verify": "full"}
-                    with self.subTest(operation=operation, server=server, timeout=timeout), \
-                            mock.patch.object(bench.subprocess, "Popen") as popen, \
-                            mock.patch.object(bench.threading, "Thread"):
-                        popen.return_value.poll.return_value = 0
-                        worker = bench.Worker(args, stream, config, server, gpu_memory,
-                                              "127.0.0.1", 18516)
-                        try:
-                            command = popen.call_args.args[0]
-                            self.assertEqual(command.count("--setup-timeout"), 1)
-                            value = command[command.index("--setup-timeout") + 1]
-                            self.assertEqual(float(value), timeout)
-                        finally:
-                            worker.close()
+        # Per-GPU processes remain only for B READ sources and both WRITE roles.
+        for operation, server in (("read", True), ("write", True), ("write", False)):
+            for timeout in (120, 300):
+                gpu_memory = server if operation == "read" else not server
+                role = "source" if gpu_memory else "receiver"
+                argv = ["--role", role, "--setup-timeout", str(timeout)]
+                if role == "receiver":
+                    argv += ["--peer", "127.0.0.1", "--nics", "mlx5_0"]
+                args = bench.parse_args(argv)
+                stream = {"gpu": 0, "gpu_nic": "mlx5_7", "cpu_nic": "mlx5_0", "port": 18516}
+                config = {"op": operation, "numa": "auto", "size": 4096, "depth": 4,
+                          "warmup": 5, "duration": 60, "interval": 1, "timeout_ms": 30000,
+                          "qps": 4, "chunk": 65536, "outstanding": 8, "verify": "full"}
+                with self.subTest(operation=operation, server=server, timeout=timeout), \
+                        mock.patch.object(bench.subprocess, "Popen") as popen, \
+                        mock.patch.object(bench.threading, "Thread"):
+                    popen.return_value.poll.return_value = 0
+                    worker = bench.Worker(args, stream, config, server, gpu_memory,
+                                          "127.0.0.1", 18516)
+                    try:
+                        command = popen.call_args.args[0]
+                        self.assertEqual(command.count("--setup-timeout"), 1)
+                        value = command[command.index("--setup-timeout") + 1]
+                        self.assertEqual(float(value), timeout)
+                        self.assertNotIn("--read-rounds", command)
+                    finally:
+                        worker.close()
+
+    def test_read_client_is_one_process_for_all_streams(self):
+        args = bench.parse_args(["--role", "receiver", "--peer", "10.0.0.2", "--nics", "mlx5_0",
+                                 "--setup-timeout", "300"])
+        streams = [{"gpu": g, "gpu_nic": f"mlx5_{g}"} for g in (0, 3, 5)]
+        config = bench.make_config(args, streams)
+        with mock.patch.object(bench.subprocess, "Popen") as popen, \
+                mock.patch.object(bench.threading, "Thread"):
+            popen.return_value.poll.return_value = 0
+            client = bench.ReadClient(args, config, "10.0.0.2", [18516, 18517, 18518])
+            try:
+                self.assertEqual(popen.call_count, 1)
+                command = popen.call_args.args[0]
+                value = lambda flag: command[command.index(flag) + 1]
+                self.assertEqual(value("--streams"), "0:mlx5_0:18516,3:mlx5_0:18517,5:mlx5_0:18518")
+                self.assertEqual(value("--peer-ip"), "10.0.0.2")
+                self.assertEqual((value("--op"), value("--memory"), value("--role")), ("read", "cpu", "client"))
+                self.assertEqual((value("--depth"), value("--read-rounds")), ("1", "1"))
+                self.assertEqual(float(value("--setup-timeout")), 300)
+                for flag in ("--nic", "--peer-port", "--stream"):
+                    self.assertNotIn(flag, command)
+            finally:
+                client.close()
+        with self.assertRaises(ValueError):
+            bench.ReadClient(args, config, "10.0.0.2", [18516])
 
     def test_invalid_data_port_is_not_defaulted(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -291,6 +351,7 @@ class ControllerTests(unittest.TestCase):
         for operation in ("read", "write"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory(dir=Path(__file__).parent) as root:
                 FakeWorker.records = []
+                FakeReadClient.instances = []
                 left, right = control_pair()
                 source = bench.parse_args(["--role", "source", "--gpus", "0,3", "--setup-timeout", "2"])
                 output = str(Path(root) / "result.json")
@@ -309,6 +370,7 @@ class ControllerTests(unittest.TestCase):
                         right.sock.shutdown(socket.SHUT_RDWR)
                 try:
                     with mock.patch.object(bench, "Worker", FakeWorker), \
+                            mock.patch.object(bench, "ReadClient", FakeReadClient), \
                             mock.patch.object(bench, "selected_gpus", return_value=offered), \
                             contextlib.redirect_stdout(io.StringIO()):
                         thread = threading.Thread(target=run_source, daemon=True)
@@ -331,9 +393,17 @@ class ControllerTests(unittest.TestCase):
                     gpu_roles = [r for r in FakeWorker.records if r[2]]
                     cpu_roles = [r for r in FakeWorker.records if not r[2]]
                     self.assertTrue(all(r[0] == "source" for r in gpu_roles))
-                    self.assertTrue(all(r[0] == "receiver" for r in cpu_roles))
+                    self.assertEqual(sorted(r[3] for r in gpu_roles), [0, 3])
                     self.assertTrue(all(r[1] == (operation == "read") for r in gpu_roles))
-                    self.assertTrue(all(r[1] == (operation == "write") for r in cpu_roles))
+                    if operation == "read":
+                        # A: exactly one READ process, with one source port per GPU stream.
+                        self.assertEqual(cpu_roles, [])
+                        self.assertEqual(len(FakeReadClient.instances), 1)
+                        self.assertEqual(FakeReadClient.instances[0].gpus, [0, 3])
+                        self.assertEqual(len(set(FakeReadClient.instances[0].ports)), 2)
+                    else:
+                        self.assertEqual(FakeReadClient.instances, [])
+                        self.assertTrue(all(r[0] == "receiver" and r[1] for r in cpu_roles))
                 finally:
                     for worker in source_workers + receiver_workers:
                         worker.close()
@@ -415,38 +485,26 @@ class ReadRoundTests(unittest.TestCase):
             bench.report_sample(output[0], None)
         self.assertIn("latency=--", text.getvalue())
 
-    def test_barrier_waits_for_slowest_gpu_before_next_round(self):
-        records = {"submitted": {}, "completed": {}, "next": 1}
-        class BarrierWorker(FakeWorker):
-            def command(self, text):
-                if text.startswith("round "):
-                    round_id = int(text.split()[1])
-                    if round_id > 1:
-                        if records["completed"].get(round_id - 1) != {0, 1}:
-                            raise AssertionError("next round started before all GPU completions")
-                    records["submitted"].setdefault(round_id, set()).add(self.stream)
-                super().command(text)
-
-            def event(self):
-                data = super().event()
-                if data and data["event"] == "round_done":
-                    # GPU1 has no completion visible until both requests were submitted.
-                    if self.stream == 1 and records["submitted"][data["round"]] != {0, 1}:
-                        self.events.put(data)
-                        return None
-                    records["completed"].setdefault(data["round"], set()).add(self.stream)
-                return data
+    def test_single_process_round_covers_every_gpu(self):
         args = bench.parse_args(["--role", "receiver", "--peer", "127.0.0.1", "--nics", "mlx5_0",
                                  "--duration", "0.1", "--interval", "0.1", "--warmup", "0"])
         streams = [{"gpu": i, "gpu_nic": "mlx5_1"} for i in (0, 1)]
         config = bench.make_config(args, streams)
-        workers = [BarrierWorker(args, s, config, False, False) for s in streams]
-        for worker in workers:
-            worker.events.get_nowait()
-        result = bench.run_synchronized_read(workers, config, streams, lambda e: None)
+        client = FakeReadClient(args, config, "127.0.0.1", [1, 2])
+        client.events.get_nowait()
+        result = bench.run_synchronized_read(client, config, streams, lambda e: None)
         self.assertGreater(config["round_summary"]["rounds"], 0)
+        self.assertEqual([r["stream"] for r in result], [0, 1])
         self.assertEqual(result[0]["operations"], result[1]["operations"])
-        self.assertTrue(all(group == {0, 1} for group in records["completed"].values()))
+
+        class MissingGpuClient(FakeReadClient):
+            def round_streams(self):
+                return super().round_streams()[:1]
+        config = bench.make_config(args, [dict(s) for s in streams])
+        client = MissingGpuClient(args, config, "127.0.0.1", [1, 2])
+        client.events.get_nowait()
+        with self.assertRaisesRegex(ValueError, "every configured GPU"):
+            bench.run_synchronized_read(client, config, config["streams"], lambda e: None)
 
 
 if __name__ == "__main__":

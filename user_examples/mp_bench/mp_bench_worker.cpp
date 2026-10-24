@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -39,6 +40,7 @@ using Clock = std::chrono::steady_clock;
 volatile std::sig_atomic_t interrupted = 0;
 constexpr const char* kServerHost = "mp-bench-server";
 constexpr int64_t kNsPerSecond = 1000000000;
+constexpr size_t kMaxStreams = 16;
 
 void onSignal(int signal) { interrupted = signal; }
 
@@ -123,6 +125,42 @@ int64_t secondsNs(const std::string& value, const std::string& flag, bool allow_
     return ns;
 }
 
+bool validNicName(const std::string& name) {
+    return !name.empty() && std::all_of(name.begin(), name.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_' || c == '.' || c == '-';
+    });
+}
+
+// One READ stream of the single receiver process: GPU label, local NIC and source data port.
+struct StreamSpec {
+    int gpu = 0;
+    std::string nic;
+    int port = 0;
+};
+
+std::vector<StreamSpec> parseStreams(const std::string& text) {
+    std::vector<StreamSpec> streams;
+    size_t begin = 0;
+    for (;;) {
+        const size_t end = text.find(',', begin);
+        const std::string item = text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        const size_t first = item.find(':'), last = item.rfind(':');
+        if (first == std::string::npos || first == last) fail("--streams entries must be GPU:NIC:PORT");
+        StreamSpec spec;
+        spec.gpu = integerNumber(item.substr(0, first), "--streams GPU");
+        spec.nic = item.substr(first + 1, last - first - 1);
+        spec.port = integerNumber(item.substr(last + 1), "--streams PORT");
+        if (spec.gpu < 0 || !validNicName(spec.nic) || spec.port < 1 || spec.port > 65535)
+            fail("--streams entries require GPU >= 0, a valid NIC name and PORT in [1,65535]");
+        for (const auto& other : streams)
+            if (other.gpu == spec.gpu) fail("--streams contains a duplicate GPU");
+        streams.push_back(std::move(spec));
+        if (streams.size() > kMaxStreams) fail("--streams supports at most 16 GPU streams");
+        if (end == std::string::npos) return streams;
+        begin = end + 1;
+    }
+}
+
 struct Options {
     std::string role, memory, op, nic, peer_ip, numa = "auto", verify = "full";
     int gpu = -1, stream = 0, listen_port = 0, peer_port = 0;
@@ -133,13 +171,14 @@ struct Options {
     int64_t setup_timeout_ns = 120 * kNsPerSecond;
     bool read_rounds = false;
     size_t total = 0;
+    std::vector<StreamSpec> streams;
 
     static Options parse(int argc, char** argv) {
         const std::vector<std::string> allowed = {
             "--role", "--memory", "--op", "--nic", "--gpu", "--numa", "--listen-port",
             "--peer-ip", "--peer-port", "--stream", "--size", "--depth", "--warmup",
             "--duration", "--interval", "--timeout-ms", "--qps", "--chunk", "--outstanding",
-            "--verify", "--setup-timeout", "--read-rounds"};
+            "--verify", "--setup-timeout", "--read-rounds", "--streams"};
         std::unordered_map<std::string, std::string> args;
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
@@ -161,7 +200,7 @@ struct Options {
         o.role = required("--role");
         o.memory = required("--memory");
         o.op = required("--op");
-        o.nic = required("--nic");
+        o.nic = get("--nic", "");
         o.peer_ip = get("--peer-ip", "");
         o.numa = get("--numa", "auto");
         o.verify = get("--verify", "full");
@@ -199,17 +238,28 @@ struct Options {
         if (o.role != "server" && o.role != "client") fail("--role must be server or client");
         if (o.memory != "cpu" && o.memory != "gpu") fail("--memory must be cpu or gpu");
         if (o.op != "read" && o.op != "write") fail("--op must be read or write");
-        if (o.read_rounds && (o.op != "read" || o.depth != 1))
-            fail("--read-rounds 1 requires --op read and --depth 1");
+        if (args.count("--streams")) {
+            if (o.role != "client" || o.memory != "cpu" || o.op != "read")
+                fail("--streams is only valid for the CPU READ client");
+            if (args.count("--nic") || args.count("--peer-port") || args.count("--stream"))
+                fail("--streams replaces --nic, --peer-port and --stream");
+            if (!o.read_rounds || o.depth != 1) fail("--streams requires --read-rounds 1 and --depth 1");
+            o.streams = parseStreams(args.at("--streams"));
+        } else {
+            if (o.nic.empty()) fail("required option: --nic");
+            if (o.nic.find_first_of(", \t\r\n") != std::string::npos) fail("--nic must name exactly one NIC");
+            if (o.read_rounds) fail("--read-rounds 1 requires --streams");
+            if (o.role == "client" && o.op == "read")
+                fail("the CPU READ client requires --streams: one process serves all GPU streams");
+        }
         if (o.verify != "none" && o.verify != "full") fail("--verify must be none or full");
         if (o.stream < 0 || o.gpu < -1) fail("--stream must be nonnegative and --gpu must be >= -1");
-        if (o.nic.find_first_of(", \t\r\n") != std::string::npos) fail("--nic must name exactly one NIC");
         if (o.numa != "auto" && integerNumber(o.numa, "--numa") < 0)
             fail("--numa must be auto or a nonnegative node ID");
         if (o.listen_port < 0 || o.listen_port > 65535 || o.peer_port < 0 || o.peer_port > 65535)
             fail("TCP ports must be in [0,65535]");
-        if (o.role == "client" && (o.peer_ip.empty() || o.peer_port == 0))
-            fail("client requires --peer-ip and a nonzero --peer-port");
+        if (o.role == "client" && (o.peer_ip.empty() || (o.streams.empty() && o.peer_port == 0)))
+            fail("client requires --peer-ip and a nonzero --peer-port (or --streams)");
         const bool gpu_expected = (o.role == "server" && o.op == "read") ||
                                   (o.role == "client" && o.op == "write");
         if ((o.memory == "gpu") != gpu_expected)
@@ -234,10 +284,12 @@ void setEnvironment(const char* key, const std::string& value) {
         fail(std::string("setenv ") + key + ": " + std::strerror(errno));
 }
 
-void configureEnvironment(const Options& o) {
+void configureEnvironment(const Options& o, const std::vector<std::string>& nics) {
+    // Must run before any MPComm object exists: constructors read these variables and
+    // no library thread may be running while the environment is modified.
     const char* filter = std::getenv("MPCOMM_NIC_FILTER");
-    if (filter && *filter && o.nic != filter)
-        fail("existing MPCOMM_NIC_FILTER differs from --nic; explicitly remove or correct it");
+    if (filter && *filter && (nics.size() != 1 || nics[0] != filter))
+        fail("existing MPCOMM_NIC_FILTER differs from the selected NIC(s); explicitly remove or correct it");
     std::vector<std::string> remove;
     for (char** item = environ; item && *item; ++item) {
         std::string key(*item);
@@ -250,7 +302,8 @@ void configureEnvironment(const Options& o) {
     }
     setEnvironment("MPCOMM_PXN_ENABLE", "0");
     setEnvironment("MPCOMM_LOG_LEVEL", "error");
-    setEnvironment("MPCOMM_NIC_FILTER", o.nic);
+    if (nics.size() == 1) setEnvironment("MPCOMM_NIC_FILTER", nics[0]);
+    else if (::unsetenv("MPCOMM_NIC_FILTER") != 0) fail("unsetenv failed for MPCOMM_NIC_FILTER");
     setEnvironment("MPCOMM_QPS_PER_CONNECTION", std::to_string(o.qps));
     setEnvironment("MPCOMM_MAX_RDMA_TRANSFER_SIZE", std::to_string(o.chunk));
     setEnvironment("MPCOMM_MAX_OUTSTANDING_PER_QP", std::to_string(o.outstanding));
@@ -433,10 +486,62 @@ void addCount(uint64_t& count, uint64_t amount) {
     count += amount;
 }
 
+// Line-based stdin commands from the Python controller.
+class Controller {
+public:
+    std::string wait(int64_t timeout_ns, int pump_ms) {
+        const int64_t deadline = nowNs() + timeout_ns;
+        for (;;) {
+            checkSignal();
+            input.pump(pump_ms);
+            std::string command;
+            if (input.take(command)) return command;
+            if (input.eof()) fail("controller stdin EOF before the next command");
+            if (nowNs() >= deadline) fail("controller stdin command timed out");
+        }
+    }
+
+    // Rate-limited check during transfers: no command may arrive and stdin must stay open.
+    void check() {
+        checkSignal();
+        const int64_t now = nowNs();
+        if (now < next_check_ns_) return;
+        next_check_ns_ = now + 10000000;
+        input.pump(0);
+        std::string command;
+        if (input.take(command)) fail("unexpected controller command during transfer: " + command);
+        if (input.eof()) fail("controller stdin EOF during transfer");
+    }
+
+    void checkSoon() { next_check_ns_ = 0; }
+
+    Input input;
+
+private:
+    int64_t next_check_ns_ = 0;
+};
+
+int64_t commandTimeout(const Options& o) {
+    return std::max(o.setup_timeout_ns, o.warmup_ns + o.timeout_ns + 30 * kNsPerSecond);
+}
+
+int64_t measurementStart(const std::string& command, const Options& o) {
+    const std::string prefix = "measure ";
+    if (command.rfind(prefix, 0) != 0) fail("expected stdin command: measure <start_ns>");
+    const uint64_t raw_start = unsignedNumber(command.substr(prefix.size()), "measure start_ns");
+    if (raw_start > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - o.duration_ns))
+        fail("measurement deadline overflows int64 nanoseconds");
+    const int64_t start = static_cast<int64_t>(raw_start);
+    const int64_t now = nowNs();
+    if (start <= now) fail("measurement start must be in the future on CLOCK_MONOTONIC");
+    if (start - now > commandTimeout(o)) fail("measurement start is beyond the controller barrier timeout");
+    return start;
+}
+
 class Worker {
 public:
     explicit Worker(Options options) : options_(std::move(options)) {
-        configureEnvironment(options_);
+        configureEnvironment(options_, {options_.nic});
         comm_ = std::make_unique<mpcomm::MPComm>();
     }
 
@@ -487,7 +592,6 @@ private:
             << ",\"op\":" << jsonString(options_.op) << ",\"pattern\":" << unsigned(options_.pattern())
             << ",\"qps\":" << options_.qps << ",\"chunk\":" << options_.chunk
             << ",\"outstanding\":" << options_.outstanding
-            << ",\"read_rounds\":" << (options_.read_rounds ? "true" : "false")
             << ",\"clock_ns\":" << nowNs() << ",\"allocated_bytes\":" << options_.total
             << ",\"allocated\":true}";
         emit(out.str());
@@ -500,8 +604,7 @@ private:
             << ",\"operations\":" << counts.operations << ",\"elapsed_ns\":" << elapsed
             << ",\"window\":" << sample_window_ << ",\"errors\":0";
         if (std::strcmp(event, "result") == 0) {
-            out << ",\"read_rounds\":" << (options_.read_rounds ? "true" : "false")
-                << ",\"drain_bytes\":" << counts.drain_bytes
+            out << ",\"drain_bytes\":" << counts.drain_bytes
                 << ",\"drain_operations\":" << counts.drain_operations
                 << ",\"verified\":" << (verified ? verified : "null")
                 << ",\"verification\":" << jsonString(options_.verify == "none" ? "none" :
@@ -518,13 +621,13 @@ private:
         ready();
         for (;;) {
             checkSignal();
-            input_.pump(100);
+            controller_.input.pump(100);
             std::string command;
-            if (input_.take(command)) {
+            if (controller_.input.take(command)) {
                 if (command != "stop") fail("server expected stdin command: stop");
                 break;
             }
-            if (input_.eof()) break;
+            if (controller_.input.eof()) break;
         }
         shutdown();
         const char* verified = nullptr;
@@ -535,30 +638,7 @@ private:
         report("result", Counts{}, 0, verified);
     }
 
-    std::string waitCommand() {
-        const int64_t deadline = nowNs() + std::max(options_.setup_timeout_ns,
-            options_.warmup_ns + options_.timeout_ns + 30 * kNsPerSecond);
-        for (;;) {
-            checkSignal();
-            input_.pump(options_.read_rounds ? 10 : 100);
-            std::string command;
-            if (options_.read_rounds && input_.eof()) fail("controller stdin EOF before READ rounds finish");
-            if (input_.take(command)) return command;
-            if (input_.eof()) fail("controller stdin EOF before client command");
-            if (nowNs() >= deadline) fail("controller stdin command timed out");
-        }
-    }
-
-    void checkController() {
-        checkSignal();
-        const int64_t now = nowNs();
-        if (now < next_control_ns_) return;
-        next_control_ns_ = now + 10000000;
-        input_.pump(0);
-        std::string command;
-        if (input_.take(command)) fail("unexpected client command during transfer: " + command);
-        if (input_.eof()) fail("controller stdin EOF during client transfer");
-    }
+    std::string waitCommand() { return controller_.wait(commandTimeout(options_), 100); }
 
     void submit(size_t index) {
         checkSignal();
@@ -566,10 +646,7 @@ private:
         if (slot.handle != mpcomm::INVALID_TRANSFER_HANDLE) fail("attempt to reuse an active buffer slot");
         const size_t offset = index * options_.size;
         slot.submitted_ns = nowNs();
-        if (options_.op == "read")
-            slot.handle = comm_->getAsync(memory_.address() + offset, kServerHost, remote_.addr + offset, options_.size);
-        else
-            slot.handle = comm_->putAsync(memory_.address() + offset, kServerHost, remote_.addr + offset, options_.size);
+        slot.handle = comm_->putAsync(memory_.address() + offset, kServerHost, remote_.addr + offset, options_.size);
         if (slot.handle == mpcomm::INVALID_TRANSFER_HANDLE) fail("async transfer submission failed");
     }
 
@@ -581,7 +658,7 @@ private:
         if (!comm_->isTransferComplete(slot.handle)) return false;
         const int64_t observed_ns = nowNs();
         slot.completed_ns = observed_ns;
-        if (measured && !options_.read_rounds) publishDueSamples(counts, observed_ns);
+        if (measured) publishDueSamples(counts, observed_ns);
         auto result = comm_->getTransferResult(slot.handle);
         if (result.error_code != mpcomm::MPCOMM_SUCCESS || result.bytes_transferred != options_.size)
             fail("transfer result for slot " + std::to_string(index) + ": error=" +
@@ -590,7 +667,7 @@ private:
         comm_->releaseTransfer(slot.handle);
         slot.handle = mpcomm::INVALID_TRANSFER_HANDLE;
         slot.received = true;
-        if (measured && !options_.read_rounds && observed_ns >= deadline) {
+        if (measured && observed_ns >= deadline) {
             addCount(counts.drain_bytes, result.bytes_transferred);
             addCount(counts.drain_operations, 1);
         } else {
@@ -609,7 +686,7 @@ private:
     void drain(Counts& counts, bool measured, int64_t measurement_deadline) {
         const int64_t drain_deadline = nowNs() + options_.timeout_ns;
         while (active()) {
-            checkController();
+            controller_.check();
             bool progress = false;
             for (size_t i = 0; i < slots_.size(); ++i) {
                 checkSignal();
@@ -645,7 +722,7 @@ private:
         }
         size_t index = 0;
         while (nowNs() < deadline) {
-            checkController();
+            controller_.check();
             if (measured) publishDueSamples(counts, nowNs());
             if (nowNs() >= deadline) break;
             complete(index, counts, measured, deadline);
@@ -654,88 +731,6 @@ private:
             index = (index + 1) % slots_.size();
         }
         if (measured) publishDueSamples(counts, nowNs());
-    }
-
-    void verifyRead() {
-        if (options_.verify != "full" || options_.op != "read") return;
-        for (const auto& slot : slots_)
-            if (!slot.received) fail("READ verification found a slot without any successful completion");
-        memory_.verify(options_);
-    }
-
-    void runReadRounds() {
-        if (waitCommand() != "start") fail("READ rounds expected stdin command: start");
-        emit("{\"event\":\"rounds_ready\",\"stream\":" + std::to_string(options_.stream) + "}");
-        enum class Phase { Warmup, AwaitMeasure, Measured };
-        Phase phase = Phase::Warmup;
-        Counts phase_counts;
-        uint64_t last_round = 0;
-        const std::string round_prefix = "round ";
-        const std::string measure_prefix = "measure ";
-        for (;;) {
-            const std::string command = waitCommand();
-            if (command.rfind(round_prefix, 0) == 0) {
-                if (phase == Phase::AwaitMeasure)
-                    fail("READ rounds expected measure before the next round");
-                const uint64_t round = unsignedNumber(command.substr(round_prefix.size()), "round id");
-                if (last_round == std::numeric_limits<uint64_t>::max() || round != last_round + 1)
-                    fail("READ round IDs must be positive and consecutive from 1");
-                const bool measured = phase == Phase::Measured;
-                if (measured && nowNs() < measurement_start_ns_)
-                    fail("READ measurement round arrived before measurement start");
-                next_control_ns_ = 0;
-                submit(0);
-                for (;;) {
-                    checkController();
-                    if (complete(0, phase_counts, false, 0)) break;
-                }
-                last_round = round;
-                const Slot& slot = slots_[0];
-                std::ostringstream out;
-                out << "{\"event\":\"round_done\",\"stream\":" << options_.stream
-                    << ",\"round\":" << round << ",\"submitted_ns\":" << slot.submitted_ns
-                    << ",\"completed_ns\":" << slot.completed_ns
-                    << ",\"bytes\":" << options_.size << ",\"errors\":0}";
-                emit(out.str());
-            } else if (command == "warmup_done") {
-                if (phase != Phase::Warmup) fail("READ warmup_done is only valid during warmup");
-                if (phase_counts.operations == 0) fail("READ warmup requires at least one completed round");
-                verifyRead();
-                phase = Phase::AwaitMeasure;
-                emit("{\"event\":\"warmup_ready\",\"stream\":" + std::to_string(options_.stream) +
-                     ",\"operations\":" + std::to_string(phase_counts.operations) +
-                     ",\"verified\":" + (options_.verify == "full" ? "true" : "null") + "}");
-            } else if (command.rfind(measure_prefix, 0) == 0) {
-                if (phase != Phase::AwaitMeasure)
-                    fail("READ measure is only valid once, after warmup_done");
-                const uint64_t raw_start = unsignedNumber(command.substr(measure_prefix.size()), "measure start_ns");
-                if (raw_start > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - options_.duration_ns))
-                    fail("measurement deadline overflows int64 nanoseconds");
-                const int64_t start = static_cast<int64_t>(raw_start);
-                const int64_t now = nowNs();
-                if (start <= now) fail("measurement start must be in the future on CLOCK_MONOTONIC");
-                if (start - now > std::max(options_.setup_timeout_ns,
-                    options_.warmup_ns + options_.timeout_ns + 30 * kNsPerSecond))
-                    fail("measurement start is beyond the controller barrier timeout");
-                phase_counts = Counts{};
-                measurement_start_ns_ = start;
-                phase = Phase::Measured;
-                emit("{\"event\":\"measurement_ready\",\"stream\":" + std::to_string(options_.stream) +
-                     ",\"start_ns\":" + std::to_string(start) + "}");
-            } else if (command == "finish") {
-                if (phase != Phase::Measured) fail("READ finish requires measurement phase");
-                if (nowNs() < measurement_start_ns_ + options_.duration_ns)
-                    fail("READ finish arrived before the measurement deadline");
-                if (phase_counts.operations == 0) fail("READ measurement requires at least one completed round");
-                verifyRead();
-                shutdown();
-                report("result", phase_counts, options_.duration_ns,
-                       options_.verify == "full" ? "true" : nullptr);
-                return;
-            } else {
-                fail("unexpected READ rounds command: " + command);
-            }
-        }
     }
 
     void runClient() {
@@ -749,38 +744,21 @@ private:
         checkComm(comm_->updateRemoteMemoryInfo(kServerHost, remote_.rkeys), "updateRemoteMemoryInfo");
         slots_.resize(options_.depth);
         ready();
-        if (options_.read_rounds) {
-            runReadRounds();
-            return;
-        }
         if (waitCommand() != "start") fail("client expected stdin command: start");
         Counts warmup;
         const int64_t warmup_start = nowNs();
         for (size_t i = 0; i < slots_.size(); ++i) {
-            checkController();
+            controller_.check();
             submit(i);
         }
         window(warmup, warmup_start, warmup_start + options_.warmup_ns, false);
         drain(warmup, false, 0);
-        verifyRead();
         emit("{\"event\":\"warmup_ready\",\"stream\":" + std::to_string(options_.stream) +
-             ",\"operations\":" + std::to_string(warmup.operations) +
-             ",\"verified\":" + (options_.verify == "full" && options_.op == "read" ? "true" : "null") + "}");
-        const std::string command = waitCommand();
-        const std::string prefix = "measure ";
-        if (command.rfind(prefix, 0) != 0) fail("client expected stdin command: measure <start_ns>");
-        uint64_t raw_start = unsignedNumber(command.substr(prefix.size()), "measure start_ns");
-        const int64_t now = nowNs();
-        if (raw_start > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - options_.duration_ns))
-            fail("measurement deadline overflows int64 nanoseconds");
-        const int64_t start = static_cast<int64_t>(raw_start);
-        if (start <= now) fail("measurement start must be in the future on CLOCK_MONOTONIC");
-        if (start - now > std::max(options_.setup_timeout_ns,
-            options_.warmup_ns + options_.timeout_ns + 30 * kNsPerSecond))
-            fail("measurement start is beyond the controller barrier timeout");
-        next_control_ns_ = 0;
+             ",\"operations\":" + std::to_string(warmup.operations) + ",\"verified\":null}");
+        const int64_t start = measurementStart(waitCommand(), options_);
+        controller_.checkSoon();
         while (nowNs() < start) {
-            checkController();
+            controller_.check();
             const int64_t remaining = start - nowNs();
             if (remaining > 2000000)
                 std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<int64_t>(remaining - 1000000, 10000000)));
@@ -790,10 +768,8 @@ private:
         window(measured, start, deadline, true);
         drain(measured, true, deadline);
         if (measured.operations == 0) fail("measurement completed zero successful operations before its deadline");
-        verifyRead();
         shutdown();
-        report("result", measured, options_.duration_ns,
-               options_.verify == "full" && options_.op == "read" ? "true" : nullptr);
+        report("result", measured, options_.duration_ns);
     }
 
     Options options_;
@@ -801,14 +777,265 @@ private:
     std::unique_ptr<mpcomm::MPComm> comm_;
     std::vector<Slot> slots_;
     mpcomm::RemoteBufferEntry remote_{};
-    Input input_;
+    Controller controller_;
     int node_ = -1;
     bool shutdown_ = false;
-    int64_t next_control_ns_ = 0;
     int64_t measurement_start_ns_ = 0;
     int64_t next_sample_elapsed_ns_ = 0;
     int64_t last_sample_ns_ = 0;
     uint64_t sample_window_ = 0;
+};
+
+// CPU READ receiver: ONE process for all GPU streams, with one MPComm instance per
+// local NIC (normally exactly one). Streams that share a NIC therefore share that
+// instance's connection set, NUMA worker and outstanding window, as in a Decode node
+// that pulls KV from several Prefill GPUs through one NIC.
+class ReadReceiver {
+public:
+    explicit ReadReceiver(Options options) : options_(std::move(options)) {
+        for (const auto& spec : options_.streams)
+            if (std::find(nics_.begin(), nics_.end(), spec.nic) == nics_.end()) nics_.push_back(spec.nic);
+        configureEnvironment(options_, nics_);
+        for (size_t i = 0; i < nics_.size(); ++i) comms_.push_back(std::make_unique<mpcomm::MPComm>());
+        nodes_.assign(nics_.size(), -1);
+    }
+
+    ~ReadReceiver() { shutdown(); }
+
+    void run() {
+        checkSignal();
+        const std::string local = "mp-bench-client-" + std::to_string(::getpid());
+        for (size_t i = 0; i < nics_.size(); ++i) {
+            auto& instance = *comms_[i];
+            checkComm(instance.initSingleNicPair(local + "-" + nics_[i], nics_[i], 0), "initSingleNicPair");
+            if (instance.getNumNics() != 1 || instance.getDeviceName(0) != nics_[i])
+                fail("initSingleNicPair did not initialize exactly NIC " + nics_[i]);
+            if (instance.getQpsPerConnection() != options_.qps || instance.getMaxRdmaTransferSize() != options_.chunk)
+                fail("MPComm did not honor the requested QP/chunk environment");
+            nodes_[i] = options_.numa == "auto" ? instance.getNicNumaNode(nics_[i]) :
+                integerNumber(options_.numa, "--numa");
+            if (nodes_[i] < 0)
+                fail("NIC " + nics_[i] + " NUMA node is unknown; explicitly pass --numa N instead of auto");
+        }
+        for (const auto& spec : options_.streams) {
+            auto stream = std::make_unique<Stream>();
+            stream->options = options_;
+            stream->options.stream = spec.gpu;
+            stream->options.nic = spec.nic;
+            stream->options.peer_port = spec.port;
+            stream->comm_index = static_cast<size_t>(
+                std::find(nics_.begin(), nics_.end(), spec.nic) - nics_.begin());
+            // Distinct logical IDs: every source GPU process is a separate connection.
+            stream->host = std::string(kServerHost) + "-gpu" + std::to_string(spec.gpu);
+            stream->memory.allocate(stream->options, nodes_[stream->comm_index]);
+            if (stream->memory.address() > std::numeric_limits<uintptr_t>::max() - options_.total)
+                fail("local buffer address range overflows uintptr_t");
+            checkComm(comm(*stream).registerMemory(reinterpret_cast<void*>(stream->memory.address()),
+                                                    options_.total), "registerMemory");
+            streams_.push_back(std::move(stream));
+        }
+        for (auto& stream : streams_) connect(*stream);
+        ready();
+        runRounds();
+    }
+
+private:
+    struct Stream {
+        Options options;
+        size_t comm_index = 0;
+        std::string host;
+        Memory memory;
+        mpcomm::RemoteBufferEntry remote{};
+        Slot slot;
+        Counts counts;
+    };
+
+    mpcomm::MPComm& comm(const Stream& stream) { return *comms_[stream.comm_index]; }
+
+    std::string label(const Stream& stream) const { return "GPU " + std::to_string(stream.options.stream); }
+
+    void shutdown() noexcept {
+        if (shutdown_) return;
+        shutdown_ = true;
+        for (auto& c : comms_) c->shutdown();
+        for (auto& stream : streams_) {
+            if (stream->slot.handle != mpcomm::INVALID_TRANSFER_HANDLE) {
+                comm(*stream).releaseTransfer(stream->slot.handle);
+                stream->slot.handle = mpcomm::INVALID_TRANSFER_HANDLE;
+            }
+        }
+    }
+
+    void connect(Stream& stream) {
+        auto& c = comm(stream);
+        const int port = stream.options.peer_port;
+        checkComm(c.connect(stream.host, options_.peer_ip, port), "connect");
+        checkComm(c.queryRemoteBufferByNuma(stream.host, options_.peer_ip, port, -1, stream.remote),
+                  "queryRemoteBufferByNuma");
+        if (stream.remote.length < options_.total || stream.remote.rkeys.size() != 1 || stream.remote.rkeys[0] == 0)
+            fail(label(stream) + ": remote buffer is too small or does not advertise exactly one valid rkey");
+        if (stream.remote.addr > std::numeric_limits<uintptr_t>::max() - options_.total)
+            fail(label(stream) + ": remote buffer address range overflows uintptr_t");
+        checkComm(c.updateRemoteMemoryInfo(stream.host, stream.remote.rkeys), "updateRemoteMemoryInfo");
+    }
+
+    void ready() {
+        std::ostringstream out;
+        out << "{\"event\":\"ready\",\"role\":\"client\",\"op\":\"read\",\"memory\":\"cpu\""
+            << ",\"processes\":1,\"instances\":" << comms_.size() << ",\"size\":" << options_.size
+            << ",\"qps\":" << options_.qps << ",\"chunk\":" << options_.chunk
+            << ",\"outstanding\":" << options_.outstanding << ",\"clock_ns\":" << nowNs() << ",\"streams\":[";
+        for (size_t i = 0; i < streams_.size(); ++i) {
+            const Stream& s = *streams_[i];
+            if (i) out << ',';
+            out << "{\"stream\":" << s.options.stream << ",\"nic\":" << jsonString(s.options.nic)
+                << ",\"numa\":" << nodes_[s.comm_index] << ",\"pattern\":" << unsigned(s.options.pattern())
+                << ",\"allocated_bytes\":" << options_.total << '}';
+        }
+        out << "]}";
+        emit(out.str());
+    }
+
+    std::string waitCommand() { return controller_.wait(commandTimeout(options_), 10); }
+
+    void submit(Stream& stream) {
+        checkSignal();
+        if (stream.slot.handle != mpcomm::INVALID_TRANSFER_HANDLE) fail(label(stream) + ": READ slot is still active");
+        stream.slot.submitted_ns = nowNs();
+        stream.slot.handle = comm(stream).getAsync(stream.memory.address(), stream.host,
+                                                   stream.remote.addr, options_.size);
+        if (stream.slot.handle == mpcomm::INVALID_TRANSFER_HANDLE) fail(label(stream) + ": READ submission failed");
+    }
+
+    bool complete(Stream& stream) {
+        auto& slot = stream.slot;
+        if (slot.handle == mpcomm::INVALID_TRANSFER_HANDLE) return false;
+        if (nowNs() - slot.submitted_ns >= options_.timeout_ns) fail(label(stream) + ": READ observation timeout");
+        auto& c = comm(stream);
+        if (!c.isTransferComplete(slot.handle)) return false;
+        slot.completed_ns = nowNs();
+        auto result = c.getTransferResult(slot.handle);
+        if (result.error_code != mpcomm::MPCOMM_SUCCESS || result.bytes_transferred != options_.size)
+            fail(label(stream) + ": READ result error=" + std::to_string(result.error_code) +
+                 ", bytes=" + std::to_string(result.bytes_transferred) +
+                 ", expected=" + std::to_string(options_.size));
+        c.releaseTransfer(slot.handle);
+        slot.handle = mpcomm::INVALID_TRANSFER_HANDLE;
+        slot.received = true;
+        addCount(stream.counts.bytes, result.bytes_transferred);
+        addCount(stream.counts.operations, 1);
+        return true;
+    }
+
+    // One round: one getAsync per GPU stream from this process, then wait for all of them.
+    void executeRound() {
+        controller_.checkSoon();
+        for (auto& stream : streams_) submit(*stream);
+        size_t pending = streams_.size();
+        while (pending) {
+            controller_.check();
+            for (auto& stream : streams_)
+                if (complete(*stream)) --pending;
+        }
+    }
+
+    void emitRound(uint64_t round) {
+        std::ostringstream out;
+        out << "{\"event\":\"round_done\",\"round\":" << round << ",\"streams\":[";
+        for (size_t i = 0; i < streams_.size(); ++i) {
+            const Stream& s = *streams_[i];
+            if (i) out << ',';
+            out << "{\"stream\":" << s.options.stream << ",\"submitted_ns\":" << s.slot.submitted_ns
+                << ",\"completed_ns\":" << s.slot.completed_ns << ",\"bytes\":" << options_.size
+                << ",\"errors\":0}";
+        }
+        out << "]}";
+        emit(out.str());
+    }
+
+    void verify() {
+        if (options_.verify != "full") return;
+        for (const auto& stream : streams_) {
+            if (!stream->slot.received) fail(label(*stream) + ": READ verification found no successful completion");
+            stream->memory.verify(stream->options);
+        }
+    }
+
+    void reportResult(uint64_t rounds) {
+        const char* verified = options_.verify == "full" ? "true" : "null";
+        std::ostringstream out;
+        out << "{\"event\":\"result\",\"role\":\"client\",\"read_rounds\":true,\"rounds\":" << rounds
+            << ",\"results\":[";
+        for (size_t i = 0; i < streams_.size(); ++i) {
+            const Stream& s = *streams_[i];
+            if (i) out << ',';
+            out << "{\"stream\":" << s.options.stream << ",\"bytes\":" << s.counts.bytes
+                << ",\"operations\":" << s.counts.operations << ",\"elapsed_ns\":" << options_.duration_ns
+                << ",\"window\":0,\"errors\":0,\"read_rounds\":true,\"drain_bytes\":0,\"drain_operations\":0"
+                << ",\"verified\":" << verified << ",\"verification\":"
+                << jsonString(options_.verify == "none" ? "none" : "client") << '}';
+        }
+        out << "]}";
+        emit(out.str());
+    }
+
+    void runRounds() {
+        if (waitCommand() != "start") fail("READ rounds expected stdin command: start");
+        emit("{\"event\":\"rounds_ready\"}");
+        enum class Phase { Warmup, AwaitMeasure, Measured };
+        Phase phase = Phase::Warmup;
+        uint64_t rounds = 0, last_round = 0;
+        int64_t measurement_start = 0;
+        const std::string round_prefix = "round ";
+        for (;;) {
+            const std::string command = waitCommand();
+            if (command.rfind(round_prefix, 0) == 0) {
+                if (phase == Phase::AwaitMeasure) fail("READ rounds expected measure before the next round");
+                const uint64_t round = unsignedNumber(command.substr(round_prefix.size()), "round id");
+                if (last_round == std::numeric_limits<uint64_t>::max() || round != last_round + 1)
+                    fail("READ round IDs must be positive and consecutive from 1");
+                if (phase == Phase::Measured && nowNs() < measurement_start)
+                    fail("READ measurement round arrived before measurement start");
+                executeRound();
+                last_round = round;
+                addCount(rounds, 1);
+                emitRound(round);
+            } else if (command == "warmup_done") {
+                if (phase != Phase::Warmup) fail("READ warmup_done is only valid during warmup");
+                if (rounds == 0) fail("READ warmup requires at least one completed round");
+                verify();
+                phase = Phase::AwaitMeasure;
+                emit("{\"event\":\"warmup_ready\",\"rounds\":" + std::to_string(rounds) +
+                     ",\"verified\":" + (options_.verify == "full" ? "true" : "null") + "}");
+            } else if (command.rfind("measure ", 0) == 0) {
+                if (phase != Phase::AwaitMeasure) fail("READ measure is only valid once, after warmup_done");
+                measurement_start = measurementStart(command, options_);
+                rounds = 0;
+                for (auto& stream : streams_) stream->counts = Counts{};
+                phase = Phase::Measured;
+                emit("{\"event\":\"measurement_ready\",\"start_ns\":" + std::to_string(measurement_start) + "}");
+            } else if (command == "finish") {
+                if (phase != Phase::Measured) fail("READ finish requires measurement phase");
+                if (nowNs() < measurement_start + options_.duration_ns)
+                    fail("READ finish arrived before the measurement deadline");
+                if (rounds == 0) fail("READ measurement requires at least one completed round");
+                verify();
+                shutdown();
+                reportResult(rounds);
+                return;
+            } else {
+                fail("unexpected READ rounds command: " + command);
+            }
+        }
+    }
+
+    Options options_;
+    std::vector<std::string> nics_;
+    std::vector<int> nodes_;
+    std::vector<std::unique_ptr<Stream>> streams_;  // declared before comms_: buffers outlive MPComm
+    std::vector<std::unique_ptr<mpcomm::MPComm>> comms_;
+    Controller controller_;
+    bool shutdown_ = false;
 };
 }  // namespace
 
@@ -821,8 +1048,14 @@ int main(int argc, char** argv) {
             probeGpus();
             return 0;
         }
-        Worker worker(Options::parse(argc, argv));
-        worker.run();
+        Options options = Options::parse(argc, argv);
+        if (!options.streams.empty()) {
+            ReadReceiver receiver(std::move(options));
+            receiver.run();
+        } else {
+            Worker worker(std::move(options));
+            worker.run();
+        }
         return 0;
     } catch (const std::exception& error) {
         const std::string message = error.what();

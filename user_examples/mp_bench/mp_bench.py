@@ -16,15 +16,24 @@ Use --op write on A for B-initiated writes into A CPU memory (same data directio
 B --gpu-count N selects the first N visible CUDA devices; --gpus lists exact IDs.
 B --nics optionally restricts automatic PCIe-nearest NIC selection.
 A --data-ip can advertise a different address for B to reach A in WRITE mode.
-A --json PATH saves samples and final results. READ uses synchronized rounds:
-one request per GPU, all requests complete before the next round (inflight=1).
+A --json PATH saves samples and final results.
+
+Processes: B starts one native GPU source process per selected GPU (READ servers).
+For READ, A runs exactly ONE native communication process for all GPU streams: one
+MPComm instance per selected A NIC (normally one), with a separate connection to
+every GPU source. Streams sharing an A NIC share that instance's NUMA worker and
+outstanding window, like a Decode node pulling KV from several Prefill GPUs.
+WRITE keeps one native process per GPU stream on both hosts.
+
+READ uses synchronized rounds: the A process submits one getAsync per GPU, waits
+for all of them, then the controller starts the next round (inflight=1).
 Round latency = latest native completion observation minus earliest native
 submission start, in microseconds on A's CLOCK_MONOTONIC; it is not the maximum
 of independently started request durations. Output latency is the mean across
 completed rounds in each sample window, with latency_max also reported. Warmup
-and a final round completing after the deadline are excluded. Python IPC/barrier
-coordination affects throughput; timing excludes result delivery after native
-completion but includes staggered submissions. These are software-observed
+and a final round completing after the deadline are excluded. One Python IPC
+round trip per round affects throughput; timing excludes result delivery after
+native completion but includes staggered submissions. These are software-observed
 completion times, not hardware CQE timestamps. WRITE retains continuous refill
 and does not report synchronized READ latency. Verification is outside measurement. No SSH, installation, or system network
 changes are performed. With Mellanox NICs, optionally build with -DUSE_MLNX=ON.
@@ -188,26 +197,12 @@ class Control:
         return data
 
 
-class Worker:
-    def __init__(self, args, stream, config, server, gpu_memory, peer_ip=None, peer_port=None):
-        self.stream = stream["gpu"]
+class NativeProcess:
+    """One native mp_bench_worker process driven by stdin commands and JSON stdout events."""
+
+    def __init__(self, command, label):
+        self.label = label
         self.events = queue.Queue()
-        nic = stream["gpu_nic"] if gpu_memory else stream["cpu_nic"]
-        command = [str(args.worker), "--role", "server" if server else "client",
-                   "--memory", "gpu" if gpu_memory else "cpu", "--op", config["op"],
-                   "--nic", nic, "--gpu", str(self.stream if gpu_memory else -1),
-                   "--stream", str(self.stream), "--numa", str(config["numa"]),
-                   "--size", str(config["size"]), "--depth", str(config["depth"]),
-                   "--warmup", str(config["warmup"]), "--duration", str(config["duration"]),
-                   "--interval", str(config["interval"]), "--timeout-ms", str(config["timeout_ms"]),
-                   "--setup-timeout", str(args.setup_timeout),
-                   "--qps", str(config["qps"]), "--chunk", str(config["chunk"]),
-                   "--outstanding", str(config["outstanding"]), "--verify", config["verify"],
-                   "--read-rounds", "1" if config["op"] == "read" else "0"]
-        if server:
-            command += ["--listen-port", str(stream["port"])]
-        else:
-            command += ["--peer-ip", peer_ip, "--peer-port", str(peer_port)]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, bufsize=1)
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -227,7 +222,7 @@ class Worker:
                 try:
                     event = json.loads(line)
                 except ValueError:
-                    print(f"[GPU {self.stream}] {line.rstrip()}", file=sys.stderr)
+                    print(f"[{self.label}] {line.rstrip()}", file=sys.stderr)
                     continue
                 if isinstance(event, dict) and "event" in event:
                     self.events.put(event)
@@ -236,7 +231,7 @@ class Worker:
 
     def _read_errors(self):
         for line in self.process.stderr:
-            print(f"[GPU {self.stream}] {line.rstrip()}", file=sys.stderr)
+            print(f"[{self.label}] {line.rstrip()}", file=sys.stderr)
 
     def command(self, text):
         self.process.stdin.write(text + "\n")
@@ -248,17 +243,15 @@ class Worker:
         except queue.Empty:
             return None
         if data["event"] == "error":
-            raise RuntimeError(f"GPU {self.stream}: {data.get('message', data)}")
+            raise RuntimeError(f"{self.label}: {data.get('message', data)}")
         if data["event"] == "eof":
-            raise RuntimeError(f"GPU {self.stream}: worker exited before expected event")
-        if "stream" in data and int(data["stream"]) != self.stream:
-            raise ValueError("worker stream identity mismatch")
+            raise RuntimeError(f"{self.label}: worker exited before expected event")
         return data
 
     def successful_exit(self, timeout=15):
         code = self.process.wait(timeout=timeout)
         if code:
-            raise RuntimeError(f"GPU {self.stream}: worker exit code {code}")
+            raise RuntimeError(f"{self.label}: worker exit code {code}")
 
     def close(self):
         if self.process.poll() is None:
@@ -276,6 +269,77 @@ class Worker:
         self.err_reader.join(timeout=1)
         for handle in (self.process.stdin, self.process.stdout, self.process.stderr):
             handle.close()
+
+
+def common_native_options(args, config):
+    return ["--numa", str(config["numa"]), "--size", str(config["size"]),
+            "--warmup", str(config["warmup"]), "--duration", str(config["duration"]),
+            "--interval", str(config["interval"]), "--timeout-ms", str(config["timeout_ms"]),
+            "--setup-timeout", str(args.setup_timeout),
+            "--qps", str(config["qps"]), "--chunk", str(config["chunk"]),
+            "--outstanding", str(config["outstanding"]), "--verify", config["verify"]]
+
+
+class Worker(NativeProcess):
+    """Per-GPU native process: B GPU sources for READ, and both roles for WRITE."""
+
+    def __init__(self, args, stream, config, server, gpu_memory, peer_ip=None, peer_port=None):
+        self.stream = stream["gpu"]
+        nic = stream["gpu_nic"] if gpu_memory else stream["cpu_nic"]
+        command = [str(args.worker), "--role", "server" if server else "client",
+                   "--memory", "gpu" if gpu_memory else "cpu", "--op", config["op"],
+                   "--nic", nic, "--gpu", str(self.stream if gpu_memory else -1),
+                   "--stream", str(self.stream), "--depth", str(config["depth"])]
+        command += common_native_options(args, config)
+        if server:
+            command += ["--listen-port", str(stream["port"])]
+        else:
+            command += ["--peer-ip", peer_ip, "--peer-port", str(peer_port)]
+        super().__init__(command, f"GPU {self.stream}")
+
+    def event(self):
+        data = super().event()
+        if data is not None and "stream" in data and int(data["stream"]) != self.stream:
+            raise ValueError("worker stream identity mismatch")
+        return data
+
+
+class ReadClient(NativeProcess):
+    """The single A-side READ process: one connection and CPU pool per GPU stream."""
+
+    def __init__(self, args, config, peer_ip, ports):
+        streams = config["streams"]
+        if len(ports) != len(streams):
+            raise ValueError("one source port is required per GPU stream")
+        spec = ",".join(f"{s['gpu']}:{s['cpu_nic']}:{port}" for s, port in zip(streams, ports))
+        command = [str(args.worker), "--role", "client", "--memory", "cpu", "--op", "read",
+                   "--streams", spec, "--peer-ip", peer_ip, "--depth", "1", "--read-rounds", "1"]
+        command += common_native_options(args, config)
+        super().__init__(command, "A READ receiver")
+
+
+def wait_event(process, expected, timeout, check=None, pause=0.002):
+    deadline = time.monotonic() + timeout
+    while True:
+        if check:
+            check()
+        data = process.event()
+        if data is not None:
+            if data["event"] != expected:
+                raise ValueError(f"{process.label}: expected {expected}, got {data['event']}")
+            return data
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"waiting for {expected} from {process.label}")
+        time.sleep(pause)
+
+
+def per_stream(data, key, streams):
+    items = data.get(key)
+    expected = [s["gpu"] for s in streams]
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items) or \
+            [item.get("stream") for item in items] != expected:
+        raise ValueError(f"{data.get('event')} must list every configured GPU stream exactly once")
+    return items
 
 
 def wait_events(workers, expected, timeout, check=None, pause=0.002):
@@ -421,21 +485,23 @@ class ReadRoundSamples:
                 "mode": "synchronized_read"}
 
 
-def run_synchronized_read(workers, config, streams, emit, check=None):
+def run_synchronized_read(client, config, streams, emit, check=None):
     if config["depth"] != 1:
         raise ValueError("synchronized READ requires --inflight 1")
-    for worker in workers:
-        worker.command("start")
-    wait_events(workers, "rounds_ready", config["timeout_ms"] / 1000 + 30, check)
+    client.command("start")
+    wait_event(client, "rounds_ready", config["timeout_ms"] / 1000 + 30, check)
     sequence = 0
 
     def execute_round():
         nonlocal sequence
         sequence += 1
         dispatched = time.monotonic_ns()
-        for worker in workers:
-            worker.command(f"round {sequence}")
-        events = wait_events(workers, "round_done", config["timeout_ms"] / 1000 + 10, check, pause=0)
+        client.command(f"round {sequence}")
+        data = wait_event(client, "round_done", config["timeout_ms"] / 1000 + 10, check, pause=0)
+        if data.get("round") != sequence:
+            raise ValueError("incorrect READ round identity")
+        events = [dict(item, event="round_done", round=sequence)
+                  for item in per_stream(data, "streams", streams)]
         timing = round_timing(events, streams, sequence, config["size"], dispatched)
         if timing["completed_ns"] > time.monotonic_ns():
             raise ValueError("native READ round timestamp is ahead of the controller clock")
@@ -445,13 +511,11 @@ def run_synchronized_read(workers, config, streams, emit, check=None):
     execute_round()
     while time.monotonic_ns() < warmup_deadline:
         execute_round()
-    for worker in workers:
-        worker.command("warmup_done")
-    wait_events(workers, "warmup_ready", config["timeout_ms"] / 1000 + 30, check)
+    client.command("warmup_done")
+    wait_event(client, "warmup_ready", config["timeout_ms"] / 1000 + 30, check)
     start_ns = time.monotonic_ns() + 200_000_000
-    for worker in workers:
-        worker.command(f"measure {start_ns}")
-    wait_events(workers, "measurement_ready", config["timeout_ms"] / 1000 + 30, check)
+    client.command(f"measure {start_ns}")
+    wait_event(client, "measurement_ready", config["timeout_ms"] / 1000 + 30, check)
     emit({"event": "measurement_start", "message": "warmup complete"})
     while time.monotonic_ns() < start_ns:
         if check:
@@ -467,12 +531,13 @@ def run_synchronized_read(workers, config, streams, emit, check=None):
     reporter.flush(reporter.duration_ns)
     if reporter.rounds == 0:
         raise RuntimeError("no READ round completed on all GPUs before the deadline")
-    for worker in workers:
-        worker.command("finish")
-    results = wait_events(workers, "result", config["timeout_ms"] / 1000 + 30, check)
-    for worker in workers:
-        worker.successful_exit()
+    client.command("finish")
+    data = wait_event(client, "result", config["timeout_ms"] / 1000 + 30, check)
+    client.successful_exit()
+    results = per_stream(data, "results", streams)
     expected_ops = reporter.rounds + drained_rounds
+    if data.get("rounds") != expected_ops:
+        raise RuntimeError("native round count disagrees with synchronized READ rounds")
     for result in results:
         if result.get("read_rounds") is not True or result.get("errors", 0):
             raise RuntimeError("native worker did not complete synchronized READ")
@@ -488,8 +553,6 @@ def run_synchronized_read(workers, config, streams, emit, check=None):
 
 
 def run_clients(workers, config, streams, emit, check=None):
-    if config["op"] == "read":
-        return run_synchronized_read(workers, config, streams, emit, check)
     for worker in workers:
         worker.command("start")
     wait_events(workers, "warmup_ready", config["warmup"] + config["timeout_ms"] / 1000 + 30, check)
@@ -605,8 +668,8 @@ def print_mapping(config):
         print("  NOTE: some GPUs share the same nearest NIC; this is not one NIC per GPU.", flush=True)
     print("  Completion-based payload bandwidth (GB/s); TOTAL=sum(per-GPU rates).", flush=True)
     if config["op"] == "read":
-        print("  Synchronized READ: one request/GPU/round; latency=min submit to max completion. "
-              "Python IPC/barrier overhead affects throughput.\n", flush=True)
+        print("  Synchronized READ in ONE A communication process: one getAsync per GPU per round; "
+              "latency=min submit to max completion. Python IPC per round affects throughput.\n", flush=True)
 
 
 def report_sample(data, samples):
@@ -731,16 +794,20 @@ def receiver_session(args, control, workers):
         prepared = control.expect("prepared", args.setup_timeout)
         if len(prepared["streams"]) != len(config["streams"]):
             raise ValueError("incorrect source stream count")
+        ports = []
         for stream, remote in zip(config["streams"], prepared["streams"]):
             if stream["gpu"] != remote.get("gpu") or not 1 <= int(remote["port"]) <= 65535:
                 raise ValueError("incorrect source identity/port")
-            workers.append(Worker(args, stream, config, False, False, args.peer, int(remote["port"])))
-        ready = wait_events(workers, "ready", args.setup_timeout)
-        for stream, item in zip(config["streams"], ready):
-            if "numa" in item:
-                stream["cpu_numa"] = item["numa"]
-                print(f"  GPU{stream['gpu']} CPU receive pool: A:{stream['cpu_nic']} "
-                      f"NUMA={item['numa']}", flush=True)
+            ports.append(int(remote["port"]))
+        client = ReadClient(args, config, args.peer, ports)
+        workers.append(client)
+        ready = wait_event(client, "ready", args.setup_timeout)
+        for stream, item in zip(config["streams"], per_stream(ready, "streams", config["streams"])):
+            stream["cpu_numa"] = item["numa"]
+            print(f"  GPU{stream['gpu']} CPU receive pool: A:{stream['cpu_nic']} "
+                  f"NUMA={item['numa']}", flush=True)
+        print(f"  A READ receiver: 1 process, {ready.get('instances')} MPComm instance(s), "
+              f"{len(config['streams'])} connection(s)", flush=True)
 
         def check_peer():
             try:
@@ -749,8 +816,8 @@ def receiver_session(args, control, workers):
                 return
             raise RuntimeError(f"unexpected peer event: {event}")
 
-        results = run_clients(workers, config, config["streams"],
-                              lambda d: report_sample(d, samples), check_peer)
+        results = run_synchronized_read(client, config, config["streams"],
+                                        lambda d: report_sample(d, samples), check_peer)
         control.send({"event": "finish"})
         server_results = control.expect("server_results", config["timeout_ms"] / 1000 + 30)["results"]
     else:
